@@ -192,9 +192,22 @@ static void gen_stmt(Gen *g, int in_loop)
     }
     case 9: /* bounded loop */
         if (g->loops > 0) {
+            int bound;
+            uint32_t bk = rnd(3);
+
+            if (g->depth > 1) {
+                /* inner loops stay tiny so programs always terminate fast */
+                bound = 1 + (int)rnd(4);
+            } else if (bk == 0) {
+                bound = 1 + (int)rnd(4);          /* push_1..4 */
+            } else if (bk == 1) {
+                bound = 8 + (int)rnd(120);        /* push_i8 */
+            } else {
+                bound = 128 + (int)rnd(2800);     /* push_i16 */
+            }
             g->loops--;
             emit(g, "for (let i%d = 0; i%d < %d; i%d++) { ",
-                 g->vars, g->vars, 1 + (int)rnd(4), g->vars);
+                 g->vars, g->vars, bound, g->vars);
             g->vars++;
             g->depth++;
             gen_block(g);
