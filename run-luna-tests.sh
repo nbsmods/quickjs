@@ -30,4 +30,10 @@ $CC -O2 -g -Wall -o "$BUILD/luna_mods_test" -DLUNA_GC_DEBUG \
     -DCONFIG_VERSION="\"test\"" -DCONFIG_BIGNUM -D_GNU_SOURCE -lm -ldl -lpthread
 LUNA_MOD_PATHS="$BUILD/mods" "$BUILD/luna_mods_test"
 
+echo "== differential fuzz (stock vs sealed, random programs) =="
+$CC -O2 -g -Wall -o "$BUILD/luna_fuzz_test" luna_fuzz_test.c quickjs.c \
+    libregexp.c libunicode.c cutils.c libbf.c quickjs-libc.c luna_bc.c \
+    -DCONFIG_VERSION="\"test\"" -DCONFIG_BIGNUM -D_GNU_SOURCE -lm -ldl -lpthread
+"$BUILD/luna_fuzz_test" "${LUNA_FUZZ_ITERS:-1000}"
+
 echo "all Luna tests passed"
