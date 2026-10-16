@@ -28,6 +28,15 @@ extern "C" {
 
 typedef struct LunaMods LunaMods;
 
+/*
+ * Runtime integrity probe, run before any mod is loaded. The default probe
+ * checks for a debugger (ptrace plus /proc/self/status TracerPid); a host can
+ * replace it with its own check. Returning non-zero makes luna_mods_load()
+ * refuse to run anything.
+ */
+typedef int (*LunaIntegrityProbe)(void *user_data);
+void luna_mods_set_integrity_probe(LunaMods *m, LunaIntegrityProbe probe, void *user_data);
+
 /* Create a loader bound to a context. */
 LunaMods *luna_mods_create(JSContext *ctx);
 void luna_mods_destroy(LunaMods *m);

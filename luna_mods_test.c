@@ -24,6 +24,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+static int probe_fail(void *user_data)
+{
+    (void)user_data;
+    return 1;
+}
+
 static int failures = 0;
 static int checks = 0;
 
@@ -224,6 +230,8 @@ int main(void)
      * core gets copied over the stale app data copy */
     rc = luna_mods_load(mods, scan_roots, 2, app_root, antimod(NULL), &info, &info_count,
                        err, sizeof(err));
+    if (rc != 0)
+        fprintf(stderr, "load error: %s\n", err);
     check(rc == 0, "luna_mods_load succeeds");
     check(info_count == 5, "five mods discovered");
     if (info_count != 5) {
@@ -323,6 +331,22 @@ int main(void)
     check(luna_mods_count(mods) == 5, "five mods registered");
     check(JS_IsUndefined(luna_mods_exports(mods, "com.luna.mods.broken")),
           "failed mods publish no exports");
+
+    /* the integrity probe is consulted before anything is loaded */
+    {
+        LunaMods *guarded = luna_mods_create(ctx);
+        LunaModInfo *gi = NULL;
+        size_t gc = 0;
+
+        luna_mods_set_integrity_probe(guarded, probe_fail, NULL);
+        rc = luna_mods_load(guarded, scan_roots, 2, NULL, antimod(NULL), &gi, &gc, err,
+                            sizeof err);
+        check(rc != 0 && strstr(err, "integrity") != NULL,
+              "load refuses while the integrity probe fails");
+        if (rc == 0)
+            luna_mods_free_info(gi, gc);
+        luna_mods_destroy(guarded);
+    }
 
     /* version helpers */
     check(luna_version_cmp("1.2.3", "1.2.4") < 0, "1.2.3 < 1.2.4");

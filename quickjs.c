@@ -683,15 +683,10 @@ typedef struct JSFunctionBytecode {
      * with offsetof(JSFunctionBytecode, debug) when debug info is stripped.
      */
     uint8_t *luna_op_map;        /* 512: [(pos & 1) << 8] + stored -> canonical */
-    const void **luna_dispatch;  /* 512 labels, JIT specialized */
+    /* JIT specialized table: one entry per stored opcode, carrying both the
+     * canonical opcode and its handler label so the fetch is a single load */
+    struct LunaDispatchEntry *luna_dispatch;
     uint8_t *luna_ks;            /* per function operand keystream */
-    /* One decode slot per active activation: a function can be re-entered
-     * (recursion, async resume) while an instruction is decoded, so each
-     * activation owns the bytes it decoded. */
-    uint32_t *luna_slot_pos;
-    uint8_t (*luna_slot_stored)[16];
-    int luna_slot_count;
-    int luna_slot_cap;
     uint32_t *luna_atoms;        /* per function atom values */
     uint32_t luna_atom_count;
     uint32_t luna_atom_cap;
@@ -706,6 +701,11 @@ typedef struct JSFunctionBytecode {
         char *source;
     } debug;
 } JSFunctionBytecode;
+
+struct LunaDispatchEntry {
+    uint32_t op;
+    const void *label;
+};
 
 typedef struct JSBoundFunction {
     JSValue func_obj;
@@ -1126,23 +1126,32 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
  */
 static int luna_trace_seq = 0;
 
-static uint32_t luna_decode_insn(JSFunctionBytecode *b, uint32_t pos, uint8_t *stored)
+#if defined(__GNUC__) || defined(__clang__)
+#define LUNA_INLINE static inline __attribute__((always_inline))
+#else
+#define LUNA_INLINE static inline
+#endif
+
+/* flat opcode size/format tables, built by luna_build_opcode_tables() before
+ * any sealed bytecode is decoded */
+static uint8_t luna_op_size_tab[256];
+static uint8_t luna_op_fmt_tab[256];
+
+LUNA_INLINE uint32_t luna_decode_insn(JSFunctionBytecode *b, uint32_t pos, uint8_t *stored)
 {
-    const uint8_t *sizes = luna_opcode_sizes();
-    const uint8_t *fmts = luna_opcode_fmts();
+    const uint8_t *sizes = luna_op_size_tab;
+    const uint8_t *fmts = luna_op_fmt_tab;
     uint8_t *buf = b->byte_code_buf;
     int canonical = b->luna_op_map[((pos & 1) << 8) + buf[pos]];
     uint8_t size = sizes[canonical];
     uint8_t fmt = fmts[canonical];
     uint32_t k;
 
-    memcpy(stored, buf + pos + 1, size - 1);
-    for (k = 1; k < size; k++)
+    /* one pass: keep the encoded bytes and decode in place */
+    for (k = 1; k < size; k++) {
+        stored[k - 1] = buf[pos + k];
         buf[pos + k] ^= b->luna_ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
-    if (getenv ("LUNA_FETCH") && pos < 4)
-        fprintf (stderr, "  [dec] pos=%u size=%u ks=%02x %02x %02x buf=%02x %02x\n",
-                 pos, size, b->luna_ks[1], b->luna_ks[2], b->luna_ks[3],
-                 buf[pos], buf[pos + 1]);
+    }
 
     switch (fmt) {
     case LUNA_OP_FMT_ATOM:
@@ -1178,17 +1187,23 @@ static uint32_t luna_decode_insn(JSFunctionBytecode *b, uint32_t pos, uint8_t *s
     return size;
 }
 
-static void luna_reencode_insn(JSFunctionBytecode *b, uint32_t pos, const uint8_t *stored)
+LUNA_INLINE void luna_reencode_insn(JSFunctionBytecode *b, uint32_t pos, const uint8_t *stored)
 {
     uint8_t *buf = b->byte_code_buf;
-    uint8_t size = luna_opcode_sizes()[b->luna_op_map[((pos & 1) << 8) + buf[pos]]];
+    uint8_t size = luna_op_size_tab[b->luna_op_map[((pos & 1) << 8) + buf[pos]]];
 
     /*
      * Restoring is a plain copy: `stored` holds the encoded operand bytes
      * exactly as they were read, so no second XOR is applied (that would
-     * corrupt the stream).
+     * corrupt the stream). Kept as an inline loop on purpose: instructions
+     * are at most 10 bytes, so a memcpy call would dominate the fetch.
      */
-    memcpy(buf + pos + 1, stored, size - 1);
+    {
+        uint32_t n = (uint32_t)size - 1, k;
+
+        for (k = 0; k < n; k++)
+            buf[pos + 1 + k] = stored[k];
+    }
 }
 
 static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
@@ -16471,11 +16486,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSVarRef **var_refs;
     size_t alloca_size;
     /*
-     * Luna decode state: one slot per activation on the function's decode
-     * stack, because a function may be re-entered recursively or suspended
-     * while an instruction is decoded.
+     * Luna decode state for this activation. A function may be re-entered
+     * (recursion, async resume) while one of its instructions is decoded:
+     * every activation keeps its own state here, so nested activations never
+     * restore each other's bytes.
      */
-    int luna_slot = -1;
+    uint32_t luna_dec_pos = 0xffffffffu;
+    uint8_t luna_stored[16]; /* widest instruction is 10 bytes + slack */
 
 /*
  * Luna: the bytecode of a sealed mod stays in its permuted opcode encoding
@@ -16483,35 +16500,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  * instead of stock quickjs bytecode. Decoding happens at instruction fetch
  * through a per function table derived from the container key.
  */
-/*
- * Luna: acquire a decode slot for this activation. The generator/async resume
- * path jumps straight to restart:, so it acquires its slot there.
- */
-#define LUNA_ACQUIRE_SLOT()                                                 \
-    do {                                                                     \
-        if (b->luna_op_map != NULL) {                                        \
-            if (b->luna_slot_count == b->luna_slot_cap) {                    \
-                int cap = b->luna_slot_cap ? b->luna_slot_cap * 2 : 8;       \
-                                                                            \
-                b->luna_slot_pos = js_realloc (ctx, b->luna_slot_pos,        \
-                                               cap * sizeof (uint32_t));     \
-                b->luna_slot_stored = js_realloc (ctx, b->luna_slot_stored,  \
-                                                  cap * sizeof (*b->luna_slot_stored)); \
-                if (!b->luna_slot_pos || !b->luna_slot_stored) {             \
-                    b->luna_slot_cap = 0;                                    \
-                    b->luna_slot_count = 0;                                  \
-                    luna_slot = -1;                                          \
-                    goto exception;                                          \
-                }                                                            \
-                b->luna_slot_cap = cap;                                      \
-            }                                                                \
-            luna_slot = b->luna_slot_count++;                                \
-            b->luna_slot_pos[luna_slot] = 0xffffffffu;                       \
-        }                                                                    \
-    } while (0)
-
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      switch (luna_fetch_switch (b, &(pc), luna_slot))
+#define SWITCH(pc)      switch (luna_fetch_switch (b, &(pc), &luna_dec_pos, luna_stored))
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -16532,20 +16522,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (unlikely (b->luna_op_map != NULL)) {                        \
             int luna_byte = (pc)[0];                                    \
             int luna_slot_i = ((luna_ip & 1) << 8) + luna_byte;         \
-            uint32_t * luna_dp = &b->luna_slot_pos[luna_slot];          \
-            uint8_t * luna_sp = b->luna_slot_stored[luna_slot];         \
-                                                                        \
-            if (*luna_dp != 0xffffffffu)                                \
-                luna_reencode_insn (b, *luna_dp, luna_sp);               \
-            *luna_dp = luna_ip;                                         \
-            luna_decode_insn (b, luna_ip, luna_sp);                     \
-            opcode = b->luna_op_map[luna_slot_i];                       \
+            if (luna_dec_pos != 0xffffffffu)                             \
+                luna_reencode_insn (b, luna_dec_pos, luna_stored);       \
+            luna_dec_pos = luna_ip;                                     \
+            luna_decode_insn (b, luna_ip, luna_stored);                 \
             (pc)++;                                                     \
-            if (getenv ("LUNA_FETCH")) {                                \
+            /* one load yields both the opcode and the handler label: the   \
+             * JIT table always exists for permuted bytecode */           \
+            {                                                           \
+                const struct LunaDispatchEntry * luna_d =               \
+                    &b->luna_dispatch[luna_slot_i];                     \
+                                                                        \
+                opcode = (int)luna_d->op;                               \
+                goto *luna_d->label;                                     \
             }                                                           \
-            goto *(b->luna_dispatch != NULL                             \
-                       ? b->luna_dispatch[luna_slot_i]                  \
-                       : dispatch_table[opcode]);                       \
         }                                                               \
         opcode = *pc++;                                                 \
         goto *dispatch_table[opcode];                                   \
@@ -16573,7 +16563,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp = sf->cur_sp;
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
-            LUNA_ACQUIRE_SLOT ();
             sf->prev_frame = rt->current_stack_frame;
             rt->current_stack_frame = sf;
             if (s->throw_flag)
@@ -16650,19 +16639,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     {
         int o;
 
-        b->luna_dispatch = (const void **)js_malloc(ctx, 512 * sizeof(void *));
+        b->luna_dispatch = js_malloc(ctx, 512 * sizeof(*b->luna_dispatch));
         if (unlikely (!b->luna_dispatch)) {
             b->luna_op_map = NULL;
             goto exception;
         }
-        /* both parity encodings, so the fetch is one indexed jump */
-        for (o = 0; o < 512; o++)
-            b->luna_dispatch[o] = dispatch_table[b->luna_op_map[o]];
+        /* both parity encodings, with the handler label next to the opcode */
+        for (o = 0; o < 512; o++) {
+            b->luna_dispatch[o].op = b->luna_op_map[o];
+            b->luna_dispatch[o].label = dispatch_table[b->luna_op_map[o]];
+        }
     }
 #endif
 
 
-    LUNA_ACQUIRE_SLOT ();
 
  restart:
     for(;;) {
@@ -19076,16 +19066,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, *pval);
         }
     }
-    if (luna_slot >= 0) {
-        if (b->luna_slot_pos[luna_slot] != 0xffffffffu) {
-            if (getenv ("LUNA_FETCH"))
-                fprintf (stderr, "[exit] b=%p slot=%d pos=%u\n", (void *)b, luna_slot,
-                         b->luna_slot_pos[luna_slot]);
-            luna_reencode_insn (b, b->luna_slot_pos[luna_slot],
-                                b->luna_slot_stored[luna_slot]);
-        }
-        b->luna_slot_pos[luna_slot] = 0xffffffffu;
-        b->luna_slot_count = luna_slot;
+    if (luna_dec_pos != 0xffffffffu) {
+        luna_reencode_insn (b, luna_dec_pos, luna_stored);
+        luna_dec_pos = 0xffffffffu;
     }
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
@@ -20539,8 +20522,6 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
  * about the engine's internal macro layout.
  * ------------------------------------------------------------------ */
 
-static uint8_t luna_op_size_tab[256];
-static uint8_t luna_op_fmt_tab[256];
 static BOOL luna_op_tab_init;
 
 static void luna_build_opcode_tables(void)
@@ -33947,19 +33928,13 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
         b->luna_cpool_count = 0;
         js_free_rt(rt, b->luna_ks);
         b->luna_ks = NULL;
-        js_free_rt(rt, b->luna_slot_pos);
-        js_free_rt(rt, b->luna_slot_stored);
-        b->luna_slot_pos = NULL;
-        b->luna_slot_stored = NULL;
-        b->luna_slot_count = 0;
-        b->luna_slot_cap = 0;
         js_free_rt(rt, b->luna_op_map);
         b->luna_op_map = NULL;
     } else {
         free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, TRUE);
     }
     if (b->luna_dispatch) {
-        js_free_rt(rt, (void *)b->luna_dispatch);
+        js_free_rt(rt, b->luna_dispatch);
         b->luna_dispatch = NULL;
     }
 

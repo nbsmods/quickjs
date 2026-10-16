@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/ptrace.h>
 
 /* ------------------------------------------------------------------ */
 /* file helpers                                                        */
@@ -462,6 +463,8 @@ struct LunaMods {
     LunaLoadedMod *mods;
     size_t count;
     LunaAntiModData am;
+    LunaIntegrityProbe integrity_probe;
+    void *integrity_user_data;
     JSModuleNormalizeFunc *prev_normalize;
     JSModuleLoaderFunc *prev_load;
     void *prev_opaque;
@@ -918,6 +921,58 @@ static size_t luna_load_pass(LunaMods *m, LunaModDir *dirs, LunaModInfo *info, s
 /* entry point                                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Default integrity probe: refuse to run while the process looks inspected.
+ *
+ * - ptrace(PTRACE_TRACEME) fails when a tracer is already attached
+ * - /proc/self/status reports the tracer pid directly
+ *
+ * None of this is a guarantee; it raises the cost of "just attach and look
+ * around", which is the realistic threat for a mod loader.
+ */
+static int luna_integrity_default(void *user_data)
+{
+#ifdef __linux__
+    FILE *f;
+    char line[256];
+
+    /*
+     * Only the status file is consulted here: PTRACE_TRACEME succeeds once
+     * and then poisons every later call on this process, which would make the
+     * check refuse to run after the very first successful load.
+     */
+    f = fopen("/proc/self/status", "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "TracerPid:", 10) == 0) {
+                int pid = atoi(line + 10);
+
+                fclose(f);
+                return pid != 0;
+            }
+        }
+        fclose(f);
+    }
+#endif
+    (void)user_data;
+    return 0;
+}
+
+static int luna_integrity_check(LunaMods *m)
+{
+    if (m->integrity_probe)
+        return m->integrity_probe(m->integrity_user_data);
+    return luna_integrity_default(NULL);
+}
+
+void luna_mods_set_integrity_probe(LunaMods *m, LunaIntegrityProbe probe, void *user_data)
+{
+    if (!m)
+        return;
+    m->integrity_probe = probe;
+    m->integrity_user_data = user_data;
+}
+
 int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
                   const char *writable_root, const LunaAntiModData *am,
                   LunaModInfo **out, size_t *out_count, char *err, size_t err_cap)
@@ -932,6 +987,10 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
         return -1;
     *out = NULL;
     *out_count = 0;
+    if (luna_integrity_check(m)) {
+        snprintf(err, err_cap, "runtime integrity check failed");
+        return -1;
+    }
     if (am)
         m->am = *am;
 
