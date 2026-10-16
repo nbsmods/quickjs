@@ -1323,12 +1323,16 @@ LUNA_INLINE void luna_decode_full(JSFunctionBytecode *b)
 {
     const uint8_t *sizes = luna_op_size_tab;
     const uint8_t *fmts = luna_op_fmt_tab;
+    /* the stream is always decoded from the private encoded copy, never from
+     * the live buffer: patching the code on the heap is reverted on the next
+     * call for free */
+    const uint8_t *enc = b->luna_enc;
     uint8_t *buf = b->byte_code_buf;
     uint8_t *ks = b->luna_ks;
     uint32_t pos = 0, len = (uint32_t)b->byte_code_len;
 
     while (pos < len) {
-        int canonical = b->luna_op_map[((pos & 1) << 8) + buf[pos]];
+        int canonical = b->luna_op_map[((pos & 1) << 8) + enc[pos]];
         uint8_t size = sizes[canonical];
         uint8_t fmt;
         uint32_t k;
@@ -1342,17 +1346,20 @@ LUNA_INLINE void luna_decode_full(JSFunctionBytecode *b)
             uint32_t idx = 0, atom, kk;
 
             for (k = 1; k < 5; k++)
-                buf[pos + k] ^= ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
+                buf[pos + k] = enc[pos + k] ^
+                               ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
             for (kk = 0; kk < 4; kk++)
                 idx |= ((uint32_t)buf[pos + 1 + kk]) << (8 * kk);
             atom = (idx < b->luna_atom_count) ? b->luna_atoms[idx] : 0;
             for (kk = 0; kk < 4; kk++)
                 buf[pos + 1 + kk] = (uint8_t)(atom >> (8 * kk));
             for (k = 5; k < size; k++)
-                buf[pos + k] ^= ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
+                buf[pos + k] = enc[pos + k] ^
+                               ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
         } else {
             for (k = 1; k < size; k++)
-                buf[pos + k] ^= ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
+                buf[pos + k] = enc[pos + k] ^
+                               ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
         }
         /*
          * Record jump targets for the fusion guard, the first time the
@@ -17121,9 +17128,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             int o;
 
             if ((uint32_t)b->byte_code_len <= LUNA_FULL_MAX) {
-                /* keep a copy of the encoded stream to restore from, and the
-                 * jump target bitmap the fusion guard needs */
+                /* the pristine encoded stream, used both as the source of
+                 * every decode and as the restore image, plus the jump
+                 * target bitmap the fusion guard needs */
                 b->luna_enc = js_malloc(ctx, b->byte_code_len);
+                if (b->luna_enc)
+                    memcpy(b->luna_enc, b->byte_code_buf, b->byte_code_len);
                 b->luna_targets = js_malloc(ctx, b->byte_code_len / 8 + 1);
                 if (unlikely (!b->luna_enc || !b->luna_targets)) {
                     js_free(ctx, b->luna_enc);
@@ -17185,7 +17195,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             b->luna_inited = 1;
         }
         if ((uint32_t)b->byte_code_len <= LUNA_FULL_MAX) {
-            memcpy (b->luna_enc, b->byte_code_buf, b->byte_code_len);
+            /*
+             * luna_enc is written once at init and never modified: the
+             * decode always starts from that trusted copy, so a patch of
+             * the stream on the heap is reverted here and by the restore
+             * without any verification pass.
+             */
             luna_decode_full (b);
 #if DIRECT_DISPATCH
             luna_fuse (b);
