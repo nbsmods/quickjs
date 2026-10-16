@@ -49,7 +49,7 @@ static const char mod_source[] =
     "export function* gen() { let t = 0; for (let i = 1; i <= 3; i++) { const v = yield i; t += v; } return t; }\n"
     "export function genRun() { const g = gen(); const a = g.next().value; const b = g.next(10).value; const c = g.next(20); return a + b + c.value; }\n";
 
-#define BIG_STMTS 150
+#define BIG_STMTS 1500
 
 static char *build_src(void)
 {
@@ -59,8 +59,10 @@ static char *build_src(void)
 
     strcpy(src, mod_source);
     strcat(src, "export function big(x) { let s = x;\n");
+    strcat(src, "for (let k = 0; k < 2; k++) {\n");
     for (i = 0; i < BIG_STMTS; i++)
         strcat(src, "s = (s * 3 + 1) % 100003;\n");
+    strcat(src, "}\n");
     strcat(src, "return s; }\n");
     strcat(src, "export function bigRec(n, x) { if (n === 0) return x; "
                 "return bigRec(n - 1, (x * 7 + 1) % 100003) + big(x); }\n");
@@ -69,10 +71,11 @@ static char *build_src(void)
 
 static int expect_big(int x)
 {
-    int i;
+    int i, k;
 
-    for (i = 0; i < BIG_STMTS; i++)
-        x = (x * 3 + 1) % 100003;
+    for (k = 0; k < 2; k++)
+        for (i = 0; i < BIG_STMTS; i++)
+            x = (x * 3 + 1) % 100003;
     return x;
 }
 

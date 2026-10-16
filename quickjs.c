@@ -640,9 +640,9 @@ typedef enum JSFunctionKindEnum {
 } JSFunctionKindEnum;
 
 #define LUNA_WINDOW        32  /* instructions decoded per window */
-#define LUNA_OWN_RANGES    16  /* decoded windows one activation may hold */
+#define LUNA_OWN_RANGES    32  /* decoded windows one activation may hold */
 #define LUNA_DEC_RANGES_INIT 8  /* initial decoded window pool per function */
-#define LUNA_FULL_MAX      1024 /* functions up to this size decode whole */
+#define LUNA_FULL_MAX      16384 /* functions up to this size decode whole */
 
 /*
  * A decoded window: a contiguous byte range of the opcode stream that is
@@ -699,8 +699,9 @@ typedef struct JSFunctionBytecode {
      * with offsetof(JSFunctionBytecode, debug) when debug info is stripped.
      */
     uint8_t *luna_op_map;        /* 512: [(pos & 1) << 8] + stored -> canonical */
-    /* inverse of luna_op_map, for re-encoding whole decoded functions */
-    uint8_t *luna_op_inv;
+    /* encoded copy of the stream, so restoring a whole decoded function is a
+     * plain memcpy; it holds ciphertext, nothing secret leaks by keeping it */
+    uint8_t *luna_enc;
     int luna_inited;             /* one time setup done */
     /* JIT specialized table: one entry per stored opcode, carrying both the
      * canonical opcode and its handler label so the fetch is a single load */
@@ -1336,38 +1337,6 @@ LUNA_INLINE void luna_decode_full(JSFunctionBytecode *b)
                 buf[pos + k] ^= ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
         }
         buf[pos] = (uint8_t)canonical;
-        pos += size;
-    }
-}
-
-LUNA_INLINE void luna_encode_full(JSFunctionBytecode *b)
-{
-    const uint8_t *sizes = luna_op_size_tab;
-    const uint8_t *fmts = luna_op_fmt_tab;
-    uint8_t *buf = b->byte_code_buf;
-    uint8_t *ks = b->luna_ks;
-    uint32_t pos = 0, len = (uint32_t)b->byte_code_len;
-
-    while (pos < len) {
-        int canonical = buf[pos];
-        uint8_t size = sizes[canonical];
-        uint8_t fmt;
-        uint32_t k;
-
-        if (unlikely (!size))
-            break;
-        fmt = fmts[canonical];
-        if (fmt == LUNA_OP_FMT_ATOM || fmt == LUNA_OP_FMT_ATOM_U8 ||
-            fmt == LUNA_OP_FMT_ATOM_U16 || fmt == LUNA_OP_FMT_ATOM_LABEL_U8 ||
-            fmt == LUNA_OP_FMT_ATOM_LABEL_U16) {
-            luna_encode_atom (b, pos);
-            for (k = 5; k < size; k++)
-                buf[pos + k] ^= ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
-        } else {
-            for (k = 1; k < size; k++)
-                buf[pos + k] ^= ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
-        }
-        buf[pos] = b->luna_op_inv[((pos & 1) << 8) + canonical];
         pos += size;
     }
 }
@@ -16973,18 +16942,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             int o;
 
             if ((uint32_t)b->byte_code_len <= LUNA_FULL_MAX) {
-                /* build the inverse permutation, used by the encode pass */
-                b->luna_op_inv = js_malloc(ctx, 512);
-                if (unlikely (!b->luna_op_inv)) {
+                /* keep a copy of the encoded stream to restore from */
+                b->luna_enc = js_malloc(ctx, b->byte_code_len);
+                if (unlikely (!b->luna_enc)) {
                     JS_ThrowOutOfMemory (ctx);
                     goto exception;
-                }
-                for (o = 0; o < 2; o++) {
-                    int t;
-
-                    for (t = 0; t < 256; t++)
-                        b->luna_op_inv[(o << 8) + b->luna_op_map[(o << 8) + t]] =
-                            (uint8_t)t;
                 }
             } else {
                 /*
@@ -17037,6 +16999,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             b->luna_inited = 1;
         }
         if ((uint32_t)b->byte_code_len <= LUNA_FULL_MAX) {
+            memcpy (b->luna_enc, b->byte_code_buf, b->byte_code_len);
             luna_decode_full (b);
             luna_own_full = 1;
             luna_saved_map = b->luna_op_map;
@@ -19459,8 +19422,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         int luna_i;
 
         if (luna_own_full) {
-            /* re-encode the stream and un-hide the map for the next call */
-            luna_encode_full (b);
+            /* plain copy of the encoded stream, then un-hide the map */
+            memcpy (b->byte_code_buf, b->luna_enc, b->byte_code_len);
             b->luna_op_map = luna_saved_map;
             luna_own_full = 0;
         }
@@ -34334,11 +34297,11 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
         js_free_rt(rt, b->luna_dec);
         js_free_rt(rt, b->luna_free);
         js_free_rt(rt, b->luna_used);
-        js_free_rt(rt, b->luna_op_inv);
+        js_free_rt(rt, b->luna_enc);
         b->luna_dec = NULL;
         b->luna_free = NULL;
         b->luna_used = NULL;
-        b->luna_op_inv = NULL;
+        b->luna_enc = NULL;
         b->luna_dec_cap = 0;
         b->luna_free_n = 0;
         b->luna_used_n = 0;
