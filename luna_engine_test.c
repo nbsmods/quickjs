@@ -43,7 +43,11 @@ static const char mod_source[] =
     "export function reTest() { return /lun(a)/.exec('luna')[1] + '42'.replace('4', '5'); }\n"
     "export function tryCatch() { try { throw new Error('boom'); } catch (e) { return e.message + '!'; } }\n"
     "export function closure() { let n = 0; return () => ++n; }\n"
-    "export function closureRun() { const f = closure(); f(); f(); return f(); }\n";
+    "export function closureRun() { const f = closure(); f(); f(); return f(); }\n"
+    "export function rec(n) { if (n <= 1) return 1; return n * rec(n - 1); }\n"
+    "export function recRun() { return rec(6) + rec(4); }\n"
+    "export function* gen() { let t = 0; for (let i = 1; i <= 3; i++) { const v = yield i; t += v; } return t; }\n"
+    "export function genRun() { const g = gen(); const a = g.next().value; const b = g.next(10).value; const c = g.next(20); return a + b + c.value; }\n";
 
 static LunaAntiModData antimod(const char *sig, const char *device)
 {
@@ -82,7 +86,7 @@ static int32_t eval_int(JSContext *ctx, const char *code)
 
 static int load_and_probe(JSContext *ctx, const uint8_t *buf, size_t len,
                           const LunaAntiModData *am, const char *expect_name,
-                          char **err)
+                          const char **err)
 {
     JSValue obj, modref, promise, ns, fn, global;
     char errbuf[512];
@@ -124,6 +128,7 @@ static int load_and_probe(JSContext *ctx, const uint8_t *buf, size_t len,
 
     fn = eval_global(ctx, "__mod.name()");
     if (JS_IsException(fn)) {
+        js_std_dump_error (ctx);
         *err = "name() threw";
         JS_FreeValue(ctx, fn);
         return -1;
@@ -154,11 +159,20 @@ static int load_and_probe(JSContext *ctx, const uint8_t *buf, size_t len,
         *err = "fib broken";
         return -1;
     }
+    if (eval_int(ctx, "__mod.recRun()") != 720 + 24) {
+        *err = "recursion broken";
+        return -1;
+    }
+    if (eval_int(ctx, "__mod.genRun()") != 6) {
+        *err = "generator broken";
+        return -1;
+    }
     if (eval_int(ctx, "__mod.sum([1, 2, 3, 4, 5])") != 15) {
         *err = "sum broken";
         return -1;
     }
     if (eval_int(ctx, "__mod.pointDist()") != 5) {
+        { JSValue v = eval_global(ctx, "__mod.pointDist()"); if (JS_IsException(v)) js_std_dump_error(ctx); else { printf("pointDist() = %d\n", JS_VALUE_GET_INT(v)); JS_FreeValue(ctx, v); } }
         *err = "class/method broken";
         return -1;
     }
@@ -241,7 +255,7 @@ int main(void)
     size_t container_len = 0;
     LunaAntiModData am;
     char errbuf[512];
-    char *msgbuf = NULL;
+    const char *errmsg = NULL;
     int rc;
 
     rt = JS_NewRuntime();
@@ -316,10 +330,10 @@ int main(void)
     }
 
     /* 4. our reader restores and runs it */
-    rc = load_and_probe(ctx2, container, container_len, &am, "luna-v1/0", &msgbuf);
+    rc = load_and_probe(ctx2, container, container_len, &am, "luna-v1/0", &errmsg);
     check(rc == 0, "container round trip executes");
     if (rc != 0)
-        fprintf(stderr, "  (%s)\n", msgbuf ? msgbuf : "unknown");
+        fprintf(stderr, "  (%s)\n", errmsg ? errmsg : "unknown");
 
     /* 5. wrong anti-mod data (different signing certificate) is rejected */
     {
@@ -439,7 +453,6 @@ int main(void)
 
     JS_FreeValue(ctx, mod);
     free(container);
-    free(msgbuf);
     JS_FreeContext(ctx);
     JS_FreeContext(ctx2);
     JS_FreeRuntime(rt);

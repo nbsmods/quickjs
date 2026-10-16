@@ -3,6 +3,7 @@
 #include "quickjs-libc.h"
 #include "luna_bc.h"
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <time.h>
 
