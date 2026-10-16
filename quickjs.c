@@ -1254,52 +1254,15 @@ LUNA_INLINE void luna_release_slot(JSFunctionBytecode *b, int slot)
 }
 
 /* Restore a decoded range back to its encoded form. */
-/*
- * After decoding, an atom operand holds the resolved JSAtom. Put the encoded
- * local index back by looking the atom up in the function table; atoms are
- * unique there, so no per range bookkeeping is needed.
- */
-LUNA_INLINE void luna_encode_atom(JSFunctionBytecode *b, uint32_t pos)
-{
-    uint8_t *p = b->byte_code_buf + pos + 1;
-    uint32_t atom, idx = 0, i;
-
-    atom = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-    for (i = 0; i < b->luna_atom_count; i++) {
-        if (b->luna_atoms[i] == atom) {
-            idx = i;
-            break;
-        }
-    }
-    for (i = 0; i < 4; i++)
-        p[i] = (uint8_t)((idx >> (8 * i)) ^
-                         b->luna_ks[(pos + 1 + i) & (LUNA_BC_KS_LEN - 1)]);
-}
-
 LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
 {
-    uint8_t *buf = b->byte_code_buf;
-    uint32_t pos = r->start;
-
-    while (pos < r->end) {
-        int canonical = b->luna_op_map[((pos & 1) << 8) + buf[pos]];
-        uint8_t size = luna_op_size_tab[canonical];
-        uint8_t fmt = luna_op_fmt_tab[canonical];
-        uint32_t k;
-
-        if (fmt == LUNA_OP_FMT_ATOM || fmt == LUNA_OP_FMT_ATOM_U8 ||
-            fmt == LUNA_OP_FMT_ATOM_U16 || fmt == LUNA_OP_FMT_ATOM_LABEL_U8 ||
-            fmt == LUNA_OP_FMT_ATOM_LABEL_U16) {
-            luna_encode_atom (b, pos);
-            for (k = 5; k < size; k++)
-                buf[pos + k] ^= b->luna_ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
-        } else {
-            for (k = 1; k < size; k++)
-                buf[pos + k] ^= b->luna_ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
-        }
-        pos += size;
-    }
+    /*
+     * Copy the encoded bytes back from the private copy: cheaper than
+     * re-encoding in place, and it reverts any heap patch inside the range
+     * at the same time.
+     */
+    memcpy (b->byte_code_buf + r->start, b->luna_enc + r->start,
+            r->end - r->start);
 }
 
 /*
@@ -1611,8 +1574,13 @@ LUNA_INLINE void luna_decode_window(JSFunctionBytecode *b, uint32_t from, LunaDe
          * Atom operands are a u32 holding the resolved JSAtom after the
          * decode; luna_encode_atom reverses that from the atom table alone.
          */
-        for (k = 1; k < size; k++) {
-            buf[pos + k] ^= b->luna_ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
+        if (b->luna_enc != NULL) {
+            for (k = 1; k < size; k++)
+                buf[pos + k] = b->luna_enc[pos + k] ^
+                               b->luna_ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
+        } else {
+            for (k = 1; k < size; k++)
+                buf[pos + k] ^= b->luna_ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
         }
         switch (fmt) {
         case LUNA_OP_FMT_ATOM:
@@ -17210,8 +17178,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  * of decoded ranges, its free stack and the compact in use
                  * list. Under DIRECT_DISPATCH the specialized dispatch table
                  * is compiled too (both parity encodings, handler label next
-                 * to the opcode so the fetch is a single load).
+                 * to the opcode so the fetch is a single load). The private
+                 * encoded copy serves the same healing role as for whole
+                 * decoded functions.
                  */
+                b->luna_enc = js_malloc(ctx, b->byte_code_len);
+                if (b->luna_enc)
+                    memcpy(b->luna_enc, b->byte_code_buf, b->byte_code_len);
                 b->luna_dec = js_malloc(ctx, LUNA_DEC_RANGES_INIT * sizeof(*b->luna_dec));
                 b->luna_free = js_malloc(ctx, LUNA_DEC_RANGES_INIT * sizeof(*b->luna_free));
                 b->luna_used = js_malloc(ctx, LUNA_DEC_RANGES_INIT * sizeof(*b->luna_used));
@@ -17220,17 +17193,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #else
                 b->luna_dispatch = NULL;
 #endif
-                if (unlikely (!b->luna_dec || !b->luna_free || !b->luna_used
+                if (unlikely (!b->luna_enc || !b->luna_dec || !b->luna_free ||
+                              !b->luna_used
 #if DIRECT_DISPATCH
                               || !b->luna_dispatch
 #endif
                               )) {
+                    js_free(ctx, b->luna_enc);
                     js_free(ctx, b->luna_dec);
                     js_free(ctx, b->luna_free);
                     js_free(ctx, b->luna_used);
 #if DIRECT_DISPATCH
                     js_free(ctx, b->luna_dispatch);
 #endif
+                    b->luna_enc = NULL;
                     b->luna_dec = NULL;
                     b->luna_free = NULL;
                     b->luna_used = NULL;
