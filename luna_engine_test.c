@@ -49,6 +49,40 @@ static const char mod_source[] =
     "export function* gen() { let t = 0; for (let i = 1; i <= 3; i++) { const v = yield i; t += v; } return t; }\n"
     "export function genRun() { const g = gen(); const a = g.next().value; const b = g.next(10).value; const c = g.next(20); return a + b + c.value; }\n";
 
+#define BIG_STMTS 150
+
+static char *build_src(void)
+{
+    size_t cap = sizeof(mod_source) + BIG_STMTS * 40 + 512;
+    char *src = malloc(cap);
+    int i;
+
+    strcpy(src, mod_source);
+    strcat(src, "export function big(x) { let s = x;\n");
+    for (i = 0; i < BIG_STMTS; i++)
+        strcat(src, "s = (s * 3 + 1) % 100003;\n");
+    strcat(src, "return s; }\n");
+    strcat(src, "export function bigRec(n, x) { if (n === 0) return x; "
+                "return bigRec(n - 1, (x * 7 + 1) % 100003) + big(x); }\n");
+    return src;
+}
+
+static int expect_big(int x)
+{
+    int i;
+
+    for (i = 0; i < BIG_STMTS; i++)
+        x = (x * 3 + 1) % 100003;
+    return x;
+}
+
+static int expect_big_rec(int n, int x)
+{
+    if (n == 0)
+        return x;
+    return expect_big_rec(n - 1, (x * 7 + 1) % 100003) + expect_big(x);
+}
+
 static LunaAntiModData antimod(const char *sig, const char *device)
 {
     LunaAntiModData am;
@@ -167,6 +201,14 @@ static int load_and_probe(JSContext *ctx, const uint8_t *buf, size_t len,
         *err = "generator broken";
         return -1;
     }
+    if (eval_int(ctx, "__mod.big(5)") != expect_big(5)) {
+        *err = "window path broken";
+        return -1;
+    }
+    if (eval_int(ctx, "__mod.bigRec(3, 2)") != expect_big_rec(3, 2)) {
+        *err = "window recursion broken";
+        return -1;
+    }
     if (eval_int(ctx, "__mod.sum([1, 2, 3, 4, 5])") != 15) {
         *err = "sum broken";
         return -1;
@@ -265,8 +307,14 @@ int main(void)
     am = antimod("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff", NULL);
 
     /* 1. compile a module */
-    mod = JS_Eval(ctx, mod_source, sizeof(mod_source) - 1, "hello.luna",
-                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_STRIP);
+    {
+        char *src = build_src();
+
+        mod = JS_Eval(ctx, src, strlen(src), "hello.luna",
+                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                      JS_EVAL_FLAG_STRIP);
+        free(src);
+    }
     check(!JS_IsException(mod), "module compiles");
     if (JS_IsException(mod))
         return 1;
