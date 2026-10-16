@@ -71,6 +71,8 @@ static void gen_atom(Gen *g, char *out, size_t outsz)
     else if (k < 8 && g->args > 0)
         snprintf(out, outsz, "a%d", (int)rnd(g->args));
     else if (k < 9)
+        snprintf(out, outsz, "o.%c", "abc"[rnd(3)]);
+    else if (k < 9)
         snprintf(out, outsz, "(%d + %d)", (int)rnd(100), (int)rnd(100));
     else
         snprintf(out, outsz, "true");
@@ -105,7 +107,7 @@ static void gen_block(Gen *g);
 static void gen_stmt(Gen *g, int in_loop)
 {
     char e[512];
-    uint32_t k = rnd(12);
+    uint32_t k = rnd(13);
 
     if (g->depth > 3) { /* keep the generator recursion bounded */
         gen_expr(g, e, sizeof(e));
@@ -211,6 +213,10 @@ static void gen_stmt(Gen *g, int in_loop)
             emit(g, "} ");
         }
         break;
+    case 11:
+        gen_expr(g, e, sizeof(e));
+        emit(g, "o.%c = %s; ", "abc"[rnd(3)], e);
+        break;
     default:
         gen_expr(g, e, sizeof(e));
         emit(g, "g = %s; ", e);
@@ -237,7 +243,7 @@ static const char *gen_program(uint64_t seed, char *src, size_t srcsz)
     for (i = 0; i < 3; i++) {
         int save_vars = g.vars;
 
-        emit(&g, "function f%d(a0, a1) { ", i);
+        emit(&g, "function f%d(a0, a1) { const o = { a: 1, b: 2, c: 3 }; ", i);
         g.vars = 0;
         g.args = 2;
         g.fns = i;
@@ -246,7 +252,7 @@ static const char *gen_program(uint64_t seed, char *src, size_t srcsz)
         emit(&g, "return a0 + a1; } ");
         g.vars = save_vars;
     }
-    emit(&g, "export function run() { ");
+    emit(&g, "export function run() { const o = { a: 5, b: 7, c: 9 }; ");
     g.vars = 0;
     g.args = 0;
     g.fns = 3;

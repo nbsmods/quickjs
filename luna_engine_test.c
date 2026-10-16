@@ -173,8 +173,10 @@ static int load_and_probe(JSContext *ctx, const uint8_t *buf, size_t len,
     {
         const char *sv = JS_ToCString(ctx, fn);
         rc = (sv && strcmp(sv, expect_name) == 0) ? 0 : -1;
-        if (rc != 0)
+        if (rc != 0) {
+            fprintf(stderr, "  name() returned '%s', expected '%s'\n", sv ? sv : "(null)", expect_name);
             *err = "unexpected name()";
+        }
         JS_FreeCString(ctx, sv);
     }
     JS_FreeValue(ctx, fn);
