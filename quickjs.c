@@ -705,6 +705,7 @@ typedef struct JSFunctionBytecode {
     /* one bit per byte: jump and exception targets, used to keep fused
      * superinstructions from swallowing a target landing inside them */
     uint8_t *luna_targets;
+    int luna_targets_built;
     int luna_inited;             /* one time setup done */
     /* JIT specialized table: one entry per stored opcode, carrying both the
      * canonical opcode and its handler label so the fetch is a single load */
@@ -1379,7 +1380,7 @@ LUNA_INLINE void luna_decode_full(JSFunctionBytecode *b)
          * The with statement family carries an atom plus a label; those are
          * rare and are simply declared a whole no fusion zone.
          */
-        if (b->luna_targets != NULL) {
+        if (b->luna_targets != NULL && !b->luna_targets_built) {
             if (fmt == OP_FMT_label8) {
                 uint32_t t = pos + 1 + (int8_t)buf[pos + 1];
 
@@ -17261,6 +17262,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              * without any verification pass.
              */
             luna_decode_full (b);
+            b->luna_targets_built = 1;
 #if DIRECT_DISPATCH
             luna_fuse (b);
 #endif
@@ -20034,7 +20036,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         if (luna_own_full) {
             /* plain copy of the encoded stream, then un-hide the map */
-            memcpy (b->byte_code_buf, b->luna_enc, b->byte_code_len);
+            int luna_n = b->byte_code_len, luna_k;
+
+            if (luna_n <= 16) {
+                for (luna_k = 0; luna_k < luna_n; luna_k++)
+                    b->byte_code_buf[luna_k] = b->luna_enc[luna_k];
+            } else {
+                memcpy (b->byte_code_buf, b->luna_enc, luna_n);
+            }
             b->luna_op_map = luna_saved_map;
             luna_own_full = 0;
         }
