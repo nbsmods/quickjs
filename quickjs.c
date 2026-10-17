@@ -1339,6 +1339,12 @@ LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
 #define LUNA_FV_OP_MOD       4
 #define LUNA_FV_OP_MATH_MOD  5
 
+#define LUNA_FV_ADD3         0
+#define LUNA_FV_SUB3         1
+#define LUNA_FV_MUL3         2
+#define LUNA_FV_LTCMP        3
+#define LUNA_FV_LTIF         4
+
 #define LUNA_FV_GLD          0
 #define LUNA_FV_LOCINC       1
 #define LUNA_FV_FLDADD       0
@@ -1527,13 +1533,40 @@ static void luna_fuse(JSFunctionBytecode *b)
             pos = q4;
             continue;
         }
-        /* binary add: glc x; glc y; add */
+        /* comparison guard: glc x; glc y; lt; if_false8 rel */
         if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
-            LUNA_HEAD(q2) == OP_add && q3 == q2 + 1 &&
+            LUNA_HEAD(q2) == OP_lt && q3 == q2 + 1 &&
+            LUNA_HEAD(q3) == OP_if_false8 && q4 == q3 + 2 &&
+            luna_target_free(b, pos + 1, q4)) {
+            buf[pos] = LUNA_FUSED_ADD3;
+            buf[pos + 3] = LUNA_FV_LTIF;
+            buf[pos + 6] = OP_nop;
+            buf[pos + 7] = OP_nop;
+            pos = q4;
+            continue;
+        }
+        /* comparison: glc x; glc y; lt */
+        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+            LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
+            LUNA_HEAD(q2) == OP_lt && q3 == q2 + 1 &&
             luna_target_free(b, pos + 1, q3)) {
             buf[pos] = LUNA_FUSED_ADD3;
-            buf[pos + 3] = OP_nop;
+            buf[pos + 3] = LUNA_FV_LTCMP;
+            buf[pos + 6] = OP_nop;
+            pos = q3;
+            continue;
+        }
+        /* binary op on two locals: glc x; glc y; add/sub/mul */
+        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+            LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
+            (LUNA_HEAD(q2) == OP_add || LUNA_HEAD(q2) == OP_sub ||
+             LUNA_HEAD(q2) == OP_mul) &&
+            q3 == q2 + 1 && luna_target_free(b, pos + 1, q3)) {
+            buf[pos] = LUNA_FUSED_ADD3;
+            buf[pos + 3] = (LUNA_HEAD(q2) == OP_add) ? LUNA_FV_ADD3
+                        : ((LUNA_HEAD(q2) == OP_sub) ? LUNA_FV_SUB3
+                                                     : LUNA_FV_MUL3);
             buf[pos + 6] = OP_nop;
             pos = q3;
             continue;
@@ -1647,7 +1680,8 @@ LUNA_INLINE void luna_decode_window(JSFunctionBytecode *b, uint32_t from, LunaDe
     r->end = from;
 
     while (count < LUNA_WINDOW && pos < (uint32_t)b->byte_code_len) {
-        int canonical = b->luna_op_map[((pos & 1) << 8) + buf[pos]];
+        int stored = b->luna_enc ? b->luna_enc[pos] : buf[pos];
+        int canonical = b->luna_op_map[((pos & 1) << 8) + stored];
         uint8_t size = sizes[canonical];
         uint8_t fmt;
         uint32_t k;
@@ -1706,9 +1740,9 @@ static int luna_fetch_switch(JSContext *ctx, JSFunctionBytecode *b,
                              const uint8_t **pc, int *own, int *own_count)
 {
     uint32_t pos = (uint32_t)(*pc - b->byte_code_buf);
-    int stored_op = (*pc)[0];
 
     if (b->luna_op_map != NULL) {
+        int stored_op = b->luna_enc ? b->luna_enc[pos] : (*pc)[0];
         int opcode, i;
 
         if (b->luna_dec != NULL) {
@@ -1748,8 +1782,14 @@ static int luna_fetch_switch(JSContext *ctx, JSFunctionBytecode *b,
         (*pc)++;
         return opcode;
     }
-    *pc += 1;
-    return stored_op;
+    /* canonical stream (whole decoded function): the live buffer is the
+     * authoritative source */
+    {
+        int stored_op = (*pc)[0];
+
+        *pc += 1;
+        return stored_op;
+    }
 }
 #endif
 
@@ -17084,7 +17124,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     {                                                                  \
         uint32_t luna_ip = (uint32_t)((pc) - b->byte_code_buf);         \
         if (unlikely (b->luna_op_map != NULL)) {                        \
-            int luna_byte = (pc)[0];                                    \
+            int luna_byte = b->luna_enc ? b->luna_enc[luna_ip] : (pc)[0]; \
             int luna_slot_i = ((luna_ip & 1) << 8) + luna_byte;         \
                                                                         \
             /* fast path: still inside the window decoded last */       \
@@ -19919,14 +19959,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp--;
             }
             BREAK;
-        luna_fused_add3: /* glc x; glc y; add */
+        luna_fused_add3: /* glc x; glc y; op, op is add/sub/mul/lt, plus the
+                            guarded compare variant */
             {
-                int x, y;
+                int x, y, sel = pc[2];
                 JSValue op1, op2;
 
                 x = get_u16(pc);
                 y = get_u16(pc + 3);
-                pc += 6;
+                if (sel == LUNA_FV_LTIF)
+                    pc += 8;
+                else
+                    pc += 6;
                 if (unlikely(JS_IsUninitialized(var_buf[x]))) {
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
                     goto exception;
@@ -19940,27 +19984,125 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 op2 = JS_DupValue(ctx, var_buf[y]);
                 *sp++ = op1;
                 *sp++ = op2;
-                {
-                    JSValue a = sp[-2], c = sp[-1];
+                if (sel == LUNA_FV_LTCMP || sel == LUNA_FV_LTIF) {
+                    int res;
 
-                    if (likely(JS_VALUE_IS_BOTH_INT(a, c))) {
-                        int64_t r = (int64_t)JS_VALUE_GET_INT(a) +
-                                    JS_VALUE_GET_INT(c);
-
-                        if (unlikely((int)r != r))
-                            goto luna_add3_slow;
-                        sp[-2] = JS_NewInt32(ctx, (int)r);
-                        sp--;
-                    } else if (JS_VALUE_IS_BOTH_FLOAT(a, c)) {
-                        sp[-2] = __JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(a) +
-                                                 JS_VALUE_GET_FLOAT64(c));
+                    op1 = sp[-2];
+                    op2 = sp[-1];
+                    if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                        sp[-2] = JS_NewBool(ctx, JS_VALUE_GET_INT(op1) <
+                                                 JS_VALUE_GET_INT(op2));
                         sp--;
                     } else {
-                    luna_add3_slow:
-                        if (js_add_slow(ctx, sp))
+                        if (js_relational_slow(ctx, sp, OP_lt))
                             goto exception;
                         sp--;
                     }
+                    if (sel == LUNA_FV_LTIF) {
+                        op1 = sp[-1];
+                        if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                            res = JS_VALUE_GET_INT(op1);
+                        } else {
+                            res = JS_ToBoolFree(ctx, op1);
+                        }
+                        sp--;
+                        if (!res)
+                            pc += (int8_t)pc[-1] - 1;
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                    }
+                } else {
+                    JSValue a = sp[-2], c = sp[-1];
+
+                    if (likely(JS_VALUE_IS_BOTH_INT(a, c))) {
+                        int64_t r;
+
+                        switch (sel) {
+                        case LUNA_FV_ADD3:
+                            r = (int64_t)JS_VALUE_GET_INT(a) +
+                                JS_VALUE_GET_INT(c);
+                            if (unlikely((int)r != r))
+                                goto luna_add3_slow_add;
+                            sp[-2] = JS_NewInt32(ctx, (int)r);
+                            sp--;
+                            break;
+                        case LUNA_FV_SUB3:
+                            r = (int64_t)JS_VALUE_GET_INT(a) -
+                                JS_VALUE_GET_INT(c);
+                            if (unlikely((int)r != r))
+                                goto luna_add3_slow_sub;
+                            sp[-2] = JS_NewInt32(ctx, (int)r);
+                            sp--;
+                            break;
+                        default: /* LUNA_FV_MUL3 */
+                            {
+                                int32_t v1 = JS_VALUE_GET_INT(a);
+                                int32_t v2 = JS_VALUE_GET_INT(c);
+                                int64_t rm = (int64_t)v1 * v2;
+
+                                if (unlikely((int)rm != rm)) {
+#ifdef CONFIG_BIGNUM
+                                    if (unlikely(sf->js_mode & JS_MODE_MATH) &&
+                                        (rm < -MAX_SAFE_INTEGER ||
+                                         rm > MAX_SAFE_INTEGER))
+                                        goto luna_add3_slow_mul;
+#endif
+                                    sp[-2] = __JS_NewFloat64(ctx, (double)rm);
+                                } else if (unlikely(rm == 0 && (v1 | v2) < 0)) {
+                                    sp[-2] = __JS_NewFloat64(ctx, -0.0);
+                                } else {
+                                    sp[-2] = JS_NewInt32(ctx, (int)rm);
+                                }
+                                sp--;
+                                break;
+                            }
+                        }
+                    } else if (sel == LUNA_FV_SUB3 &&
+                               JS_VALUE_IS_BOTH_FLOAT(a, c)) {
+                        sp[-2] = __JS_NewFloat64(ctx,
+                            JS_VALUE_GET_FLOAT64(a) - JS_VALUE_GET_FLOAT64(c));
+                        sp--;
+                    } else if (sel == LUNA_FV_ADD3 &&
+                               JS_VALUE_IS_BOTH_FLOAT(a, c)) {
+                        sp[-2] = __JS_NewFloat64(ctx,
+                            JS_VALUE_GET_FLOAT64(a) + JS_VALUE_GET_FLOAT64(c));
+                        sp--;
+                    } else if (sel == LUNA_FV_MUL3 &&
+                               JS_VALUE_IS_BOTH_FLOAT(a, c)) {
+#ifdef CONFIG_BIGNUM
+                        if (unlikely(sf->js_mode & JS_MODE_MATH))
+                            goto luna_add3_slow_mul;
+#endif
+                        sp[-2] = __JS_NewFloat64(ctx,
+                            JS_VALUE_GET_FLOAT64(a) * JS_VALUE_GET_FLOAT64(c));
+                        sp--;
+                    } else {
+                        switch (sel) {
+                        case LUNA_FV_SUB3:
+                            goto luna_add3_slow_sub;
+                        case LUNA_FV_MUL3:
+                            goto luna_add3_slow_mul;
+                        default:
+                            goto luna_add3_slow_add;
+                        }
+                    }
+                    goto luna_add3_done;
+                luna_add3_slow_add:
+                    if (js_add_slow(ctx, sp))
+                        goto exception;
+                    sp--;
+                    goto luna_add3_done;
+                luna_add3_slow_sub:
+                    if (js_binary_arith_slow(ctx, sp, OP_sub))
+                        goto exception;
+                    sp--;
+                    goto luna_add3_done;
+                luna_add3_slow_mul:
+                    if (js_binary_arith_slow(ctx, sp, OP_mul))
+                        goto exception;
+                    sp--;
+                luna_add3_done:
+                    ;
                 }
             }
             BREAK;

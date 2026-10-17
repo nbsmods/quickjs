@@ -109,7 +109,7 @@ static void gen_block(Gen *g);
 static void gen_stmt(Gen *g, int in_loop)
 {
     char e[512];
-    uint32_t k = rnd(14);
+    uint32_t k = rnd(15);
 
     if (g->depth > 3) { /* keep the generator recursion bounded */
         gen_expr(g, e, sizeof(e));
@@ -204,6 +204,22 @@ static void gen_stmt(Gen *g, int in_loop)
         g->vars = save;
         break;
     }
+    case 13: /* loop with a local bound: the glc;glc;lt;ift shape */
+        if (g->loops > 0 && g->vars > 0) {
+            int save_kind = 0;
+
+            (void)save_kind;
+            emit(g, "const t%d = %d; ", g->vars, 1 + (int)rnd(4));
+            g->loops--;
+            emit(g, "for (let i%d = 0; i%d < t%d; i%d++) { ",
+                 g->vars, g->vars, g->vars, g->vars);
+            g->vars++;
+            g->depth++;
+            gen_block(g);
+            g->depth--;
+            emit(g, "} ");
+        }
+        break;
     case 9: /* bounded loop */
         if (g->loops > 0) {
             int bound;
