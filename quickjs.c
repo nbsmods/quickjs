@@ -1212,6 +1212,8 @@ static void __attribute__((destructor)) luna_prof_dump(void)
 #define LUNA_PROF_HOOK(op) do { } while (0)
 #endif
 
+
+
 /*
  * Decoded window. Instructions are decoded in place one window at a time: a
  * window is a contiguous byte range of the opcode stream that is temporarily
@@ -1332,6 +1334,7 @@ LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
  * reach (the interior target guard refuses such fusions) */
 #define LUNA_FV_COPY         0
 #define LUNA_FV_ARGOP        1
+#define LUNA_FV_STORE        2
 #define LUNA_FV_OP_ADD       0
 #define LUNA_FV_OP_SUB       1
 #define LUNA_FV_OP_MUL       2
@@ -1476,10 +1479,11 @@ static void luna_fuse(JSFunctionBytecode *b)
         int head = LUNA_HEAD(pos);
         uint32_t q1, q2, q3, q4;
 
-        /* only four opcodes can start a fusion, reject everything else on
+        /* only these opcodes can start a fusion, reject everything else on
          * a single size load */
         if (head != OP_set_loc_uninitialized && head != OP_get_loc_check &&
-            head != OP_push_0 && head != OP_get_arg0) {
+            head != OP_push_0 && head != OP_get_arg0 && head != OP_dup &&
+            head != OP_push_i8 && head != OP_push_i16) {
             if (luna_op_size_tab[head] == 0)
                 break;
             pos += luna_op_size_tab[head];
@@ -1607,9 +1611,12 @@ static void luna_fuse(JSFunctionBytecode *b)
             LUNA_HEAD(q1) == OP_lt && q2 == q1 + 1 &&
             LUNA_HEAD(q2) == OP_if_false8 && q3 == q2 + 2 &&
             luna_target_free(b, pos + 1, q3)) {
+            /* read the variant before overwriting the opcode */
+            int v = (LUNA_HEAD(pos) == OP_push_i8) ? LUNA_FV_LTI8
+                                                   : LUNA_FV_LTI16;
+
             buf[pos] = LUNA_FUSED_FLDADD;
-            buf[pos + 3] = (LUNA_HEAD(pos) == OP_push_i8) ? LUNA_FV_LTI8
-                                                          : LUNA_FV_LTI16;
+            buf[pos + 3] = (uint8_t)v;
             pos = q3;
             continue;
         }
@@ -1620,6 +1627,22 @@ static void luna_fuse(JSFunctionBytecode *b)
             buf[pos] = LUNA_FUSED_UNINIT;
             buf[pos + 3] = OP_nop;
             pos = q2;
+            continue;
+        }
+        /* store: dup; put_loc_check y; drop (the assignment statement of an
+         * expression result, the let/const write after any computation) */
+        if (LUNA_HEAD(pos) == OP_dup && q1 == pos + 1 &&
+            LUNA_HEAD(q1) == OP_put_loc_check && q2 == q1 + 3 &&
+            LUNA_HEAD(q2) == OP_drop && q3 == q2 + 1 &&
+            luna_target_free(b, pos + 1, q3)) {
+            int y = get_u16(buf + pos + 2);
+
+            buf[pos] = LUNA_FUSED_COPY;
+            buf[pos + 1] = (uint8_t)(y & 0xff);
+            buf[pos + 2] = (uint8_t)(y >> 8);
+            buf[pos + 3] = LUNA_FV_STORE;
+            buf[pos + 4] = OP_nop;
+            pos = q3;
             continue;
         }
         /* arg op= const: get_argK; push_1..7; binop; put_argK */
@@ -19748,7 +19771,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int sel = pc[2];
 
-                if (sel == LUNA_FV_ARGOP) {
+                if (sel == LUNA_FV_STORE) {
+                    int y = get_u16(pc);
+
+                    pc += 4;
+                    if (unlikely(JS_IsUninitialized(var_buf[y]))) {
+                        JS_ThrowReferenceErrorUninitialized2(ctx, b, y, FALSE);
+                        goto exception;
+                    }
+                    set_value(ctx, &var_buf[y], sp[-1]);
+                    sp--;
+                } else if (sel == LUNA_FV_ARGOP) {
                     int id = pc[0];
                     int binop = id >> 2;
                     int arg = id & 3;

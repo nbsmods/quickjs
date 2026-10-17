@@ -109,7 +109,7 @@ static void gen_block(Gen *g);
 static void gen_stmt(Gen *g, int in_loop)
 {
     char e[512];
-    uint32_t k = rnd(15);
+    uint32_t k = rnd(16);
 
     if (g->depth > 3) { /* keep the generator recursion bounded */
         gen_expr(g, e, sizeof(e));
@@ -130,6 +130,13 @@ static void gen_stmt(Gen *g, int in_loop)
     case 2: /* assignment chain / copies: exercises glc;dup;plc;drop */
         if (g->vars > 1)
             emit(g, "v%d = v%d; ", (int)rnd(g->vars), (int)rnd(g->vars));
+        break;
+    case 14: /* expression store: exercises dup;plc;drop */
+        if (g->vars > 0) {
+            gen_expr(g, e, sizeof(e));
+            /* the unary plus keeps strings from doubling in loops */
+            emit(g, "v%d = +(%s); ", (int)rnd(g->vars), e);
+        }
         break;
     case 3: /* increments */
         if (g->vars > 0)
@@ -357,10 +364,11 @@ static void exec_module_stock(JSContext *ctx, JSValue mod, char *out, size_t out
 int main(int argc, char **argv)
 {
     int iters = argc > 1 ? atoi(argv[1]) : 300;
+    int start = getenv("LUNA_SEED_START") ? atoi(getenv("LUNA_SEED_START")) : 0;
     int i, failures = 0;
     char *src = malloc(64 * 1024);
 
-    for (i = 0; i < iters; i++) {
+    for (i = start; i < iters; i++) {
         uint64_t seed = 0x9e3779b97f4a7c15ULL * (uint64_t)(i + 1);
         char got_stock[8192], got_sealed[8192];
         LunaAntiModData am;
@@ -370,6 +378,10 @@ int main(int argc, char **argv)
         uint8_t *container = NULL;
         size_t clen = 0;
 
+        if (getenv("LUNA_SEED_TRACE"))
+            fprintf(stderr, "SEED %d\n", i);
+        if (getenv("LUNA_DUMP_SEED") && i == atoi(getenv("LUNA_DUMP_SEED")))
+            fprintf(stderr, "DUMP %s\n", src);
         if (!gen_program(seed, src, 64 * 1024))
             continue;
 
