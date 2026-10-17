@@ -1170,6 +1170,48 @@ static uint8_t luna_op_fmt_tab[256];
 
 
 
+
+#ifdef LUNA_PROF
+uint64_t luna_prof_freq[256];
+uint64_t luna_prof_pair[256][256];
+static int luna_prof_prev;
+static int luna_prof_on = -1;
+static void luna_prof_count(int op)
+{
+    if (luna_prof_on < 0)
+        luna_prof_on = getenv("LUNA_PROF") != NULL;
+    if (luna_prof_on) {
+        luna_prof_freq[op]++;
+        luna_prof_pair[luna_prof_prev][op]++;
+        luna_prof_prev = op;
+    }
+}
+static void __attribute__((destructor)) luna_prof_dump(void)
+{
+    int i, j, k, n = 0;
+    struct { uint64_t c; int a, b; } top[24], t;
+
+    if (!luna_prof_on)
+        return;
+    for (i = 0; i < 256; i++)
+        for (j = 0; j < 256; j++) {
+            if (!luna_prof_pair[i][j])
+                continue;
+            t.c = luna_prof_pair[i][j]; t.a = i; t.b = j;
+            for (k = n; k > 0 && top[k-1].c < t.c; k--)
+                top[k] = top[k-1];
+            if (k < 24) top[k] = t;
+            if (n < 24) n++;
+        }
+    for (i = 0; i < n; i++)
+        fprintf(stderr, "PAIR %d %d %llu\n", top[i].a, top[i].b,
+                (unsigned long long)top[i].c);
+}
+#define LUNA_PROF_HOOK(op) luna_prof_count (op)
+#else
+#define LUNA_PROF_HOOK(op) do { } while (0)
+#endif
+
 /*
  * Decoded window. Instructions are decoded in place one window at a time: a
  * window is a contiguous byte range of the opcode stream that is temporarily
@@ -1288,6 +1330,15 @@ LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
 
 /* variant selectors, stored in a byte of the fused span that no jump can
  * reach (the interior target guard refuses such fusions) */
+#define LUNA_FV_COPY         0
+#define LUNA_FV_ARGOP        1
+#define LUNA_FV_OP_ADD       0
+#define LUNA_FV_OP_SUB       1
+#define LUNA_FV_OP_MUL       2
+#define LUNA_FV_OP_DIV       3
+#define LUNA_FV_OP_MOD       4
+#define LUNA_FV_OP_MATH_MOD  5
+
 #define LUNA_FV_GLD          0
 #define LUNA_FV_LOCINC       1
 #define LUNA_FV_FLDADD       0
@@ -1383,6 +1434,22 @@ static int luna_target_free(JSFunctionBytecode *b, uint32_t from, uint32_t to)
     return 1;
 }
 
+/* Identifier for the binops the arg op= const fusion covers, -1 otherwise. */
+static int luna_argop_id(int op)
+{
+    switch (op) {
+    case OP_add: return LUNA_FV_OP_ADD;
+    case OP_sub: return LUNA_FV_OP_SUB;
+    case OP_mul: return LUNA_FV_OP_MUL;
+    case OP_div: return LUNA_FV_OP_DIV;
+    case OP_mod: return LUNA_FV_OP_MOD;
+#ifdef CONFIG_BIGNUM
+    case OP_math_mod: return LUNA_FV_OP_MATH_MOD;
+#endif
+    default: return -1;
+    }
+}
+
 /*
  * Rewrite runs of canonical opcodes into fused superinstructions. This is a
  * pure substitution: every fused opcode reproduces the exact semantics of
@@ -1454,7 +1521,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             LUNA_HEAD(q3) == OP_drop && q4 == q3 + 1 &&
             luna_target_free(b, pos + 1, q4)) {
             buf[pos] = LUNA_FUSED_COPY;
-            buf[pos + 3] = OP_nop;
+            buf[pos + 3] = LUNA_FV_COPY;
             buf[pos + 4] = OP_nop;
             buf[pos + 7] = OP_nop;
             pos = q4;
@@ -1520,6 +1587,25 @@ static void luna_fuse(JSFunctionBytecode *b)
             buf[pos] = LUNA_FUSED_UNINIT;
             buf[pos + 3] = OP_nop;
             pos = q2;
+            continue;
+        }
+        /* arg op= const: get_arg0; push_1..7; binop; put_arg0 */
+        if (LUNA_HEAD(pos) == OP_get_arg0 && q1 == pos + 1 &&
+            LUNA_HEAD(q1) > OP_push_0 && LUNA_HEAD(q1) <= OP_push_7 &&
+            q2 == q1 + 1 && luna_argop_id(LUNA_HEAD(q2)) >= 0 &&
+            q3 == q2 + 1 && LUNA_HEAD(q3) == OP_put_arg0 && q4 == q3 + 1 &&
+            luna_target_free(b, pos + 1, q4)) {
+            /* capture both operands before any byte is overwritten */
+            {
+                int nsel = LUNA_HEAD(q1) - OP_push_0;
+                int bsel = luna_argop_id(LUNA_HEAD(q2));
+
+                buf[pos + 2] = (uint8_t)nsel;
+                buf[pos + 1] = (uint8_t)bsel;
+            }
+            buf[pos] = LUNA_FUSED_COPY;
+            buf[pos + 3] = LUNA_FV_ARGOP;
+            pos = q4;
             continue;
         }
         /* n--: get_arg0; post_dec; put_arg0 */
@@ -17044,10 +17130,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     &b->luna_dispatch[luna_slot_i];                     \
                                                                         \
                 opcode = (int)luna_d->op;                               \
+                LUNA_PROF_HOOK (opcode);                                \
                 goto *luna_d->label;                                    \
             }                                                           \
         }                                                               \
         opcode = *pc++;                                                 \
+        LUNA_PROF_HOOK (opcode);                                        \
         goto *dispatch_table[opcode];                                   \
     }
 #define CASE(op)        case_ ## op
@@ -19612,25 +19700,168 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          * same checks and slow paths, same exception state, same relative
          * label math. Operands sit at their original byte positions.
          */
-        luna_fused_copy: /* glc x; dup; put_loc_check y; drop */
+        luna_fused_copy: /* sel 0: glc x; dup; put_loc_check y; drop
+                            sel 1: get_arg0; push_N; binop; put_arg0 */
             {
-                int x, y;
-                JSValue v;
+                int sel = pc[2];
 
-                x = get_u16(pc);
-                y = get_u16(pc + 4);
-                pc += 7;
-                if (unlikely(JS_IsUninitialized(var_buf[x]))) {
-                    JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
-                    goto exception;
+                if (sel == LUNA_FV_ARGOP) {
+                    int binop = pc[0];
+                    int32_t n = pc[1];
+                    JSValue op1, op2;
+
+                    pc += 3;
+                    *sp++ = JS_DupValue(ctx, arg_buf[0]);
+                    *sp++ = JS_NewInt32(ctx, n);
+                    op1 = sp[-2];
+                    op2 = sp[-1];
+                    switch (binop) {
+                    case LUNA_FV_OP_ADD:
+                        if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                            int64_t r = (int64_t)JS_VALUE_GET_INT(op1) +
+                                        JS_VALUE_GET_INT(op2);
+
+                            if (unlikely((int)r != r))
+                                goto luna_argop_add_slow;
+                            sp[-2] = JS_NewInt32(ctx, (int)r);
+                            sp--;
+                        } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {
+                            sp[-2] = __JS_NewFloat64(ctx,
+                                JS_VALUE_GET_FLOAT64(op1) +
+                                JS_VALUE_GET_FLOAT64(op2));
+                            sp--;
+                        } else {
+                        luna_argop_add_slow:
+                            if (js_add_slow(ctx, sp))
+                                goto exception;
+                            sp--;
+                        }
+                        break;
+                    case LUNA_FV_OP_SUB:
+                        if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                            int64_t r = (int64_t)JS_VALUE_GET_INT(op1) -
+                                        JS_VALUE_GET_INT(op2);
+
+                            if (unlikely((int)r != r))
+                                goto luna_argop_sub_slow;
+                            sp[-2] = JS_NewInt32(ctx, (int)r);
+                            sp--;
+                        } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {
+                            sp[-2] = __JS_NewFloat64(ctx,
+                                JS_VALUE_GET_FLOAT64(op1) -
+                                JS_VALUE_GET_FLOAT64(op2));
+                            sp--;
+                        } else {
+                        luna_argop_sub_slow:
+                            if (js_binary_arith_slow(ctx, sp, OP_sub))
+                                goto exception;
+                            sp--;
+                        }
+                        break;
+                    case LUNA_FV_OP_MUL:
+                        {
+                            double d;
+
+                            if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                                int32_t v1 = JS_VALUE_GET_INT(op1);
+                                int32_t v2 = JS_VALUE_GET_INT(op2);
+                                int64_t r = (int64_t)v1 * v2;
+
+                                if (unlikely((int)r != r)) {
+#ifdef CONFIG_BIGNUM
+                                    if (unlikely(sf->js_mode & JS_MODE_MATH) &&
+                                        (r < -MAX_SAFE_INTEGER ||
+                                         r > MAX_SAFE_INTEGER))
+                                        goto luna_argop_mul_slow;
+#endif
+                                    d = (double)r;
+                                    goto luna_argop_mul_fp;
+                                }
+                                if (unlikely(r == 0 && (v1 | v2) < 0)) {
+                                    d = -0.0;
+                                    goto luna_argop_mul_fp;
+                                }
+                                sp[-2] = JS_NewInt32(ctx, r);
+                                sp--;
+                            } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {
+#ifdef CONFIG_BIGNUM
+                                if (unlikely(sf->js_mode & JS_MODE_MATH))
+                                    goto luna_argop_mul_slow;
+#endif
+                                d = JS_VALUE_GET_FLOAT64(op1) *
+                                    JS_VALUE_GET_FLOAT64(op2);
+                            luna_argop_mul_fp:
+                                sp[-2] = __JS_NewFloat64(ctx, d);
+                                sp--;
+                            } else {
+                            luna_argop_mul_slow:
+                                if (js_binary_arith_slow(ctx, sp, OP_mul))
+                                    goto exception;
+                                sp--;
+                            }
+                        }
+                        break;
+                    case LUNA_FV_OP_DIV:
+                        if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                            int v1, v2;
+
+                            if (unlikely(sf->js_mode & JS_MODE_MATH))
+                                goto luna_argop_div_slow;
+                            v1 = JS_VALUE_GET_INT(op1);
+                            v2 = JS_VALUE_GET_INT(op2);
+                            sp[-2] = JS_NewFloat64(ctx, (double)v1 / (double)v2);
+                            sp--;
+                        } else {
+                        luna_argop_div_slow:
+                            if (js_binary_arith_slow(ctx, sp, OP_div))
+                                goto exception;
+                            sp--;
+                        }
+                        break;
+                    default: /* LUNA_FV_OP_MOD / LUNA_FV_OP_MATH_MOD */
+                        if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                            int v1 = JS_VALUE_GET_INT(op1);
+                            int v2 = JS_VALUE_GET_INT(op2);
+                            int r;
+
+                            /* the original handler falls back on non
+                               positive operands and on INT32_MIN -1 */
+                            if (unlikely(v1 < 0 || v2 <= 0))
+                                goto luna_argop_mod_slow;
+                            r = v1 % v2;
+                            sp[-2] = JS_NewInt32(ctx, r);
+                            sp--;
+                        } else {
+                        luna_argop_mod_slow:
+                            if (js_binary_arith_slow(ctx, sp,
+                                    binop == LUNA_FV_OP_MATH_MOD
+                                        ? OP_math_mod : OP_mod))
+                                goto exception;
+                            sp--;
+                        }
+                        break;
+                    }
+                    set_value(ctx, &arg_buf[0], sp[-1]);
+                    sp--;
+                } else {
+                    int x, y;
+                    JSValue v;
+
+                    x = get_u16(pc);
+                    y = get_u16(pc + 4);
+                    pc += 7;
+                    if (unlikely(JS_IsUninitialized(var_buf[x]))) {
+                        JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
+                        goto exception;
+                    }
+                    v = JS_DupValue(ctx, var_buf[x]);
+                    if (unlikely(JS_IsUninitialized(var_buf[y]))) {
+                        JS_FreeValue(ctx, v);
+                        JS_ThrowReferenceErrorUninitialized2(ctx, b, y, FALSE);
+                        goto exception;
+                    }
+                    set_value(ctx, &var_buf[y], v);
                 }
-                v = JS_DupValue(ctx, var_buf[x]);
-                if (unlikely(JS_IsUninitialized(var_buf[y]))) {
-                    JS_FreeValue(ctx, v);
-                    JS_ThrowReferenceErrorUninitialized2(ctx, b, y, FALSE);
-                    goto exception;
-                }
-                set_value(ctx, &var_buf[y], v);
             }
             BREAK;
         luna_fused_initadd: /* set_uninit t; glc x; glc y; add; put_locN */

@@ -33,6 +33,7 @@ typedef struct {
     int args;     /* arguments available */
     int fns;      /* callable generated functions */
     int loops;    /* bounded loop budget */
+    int loop_arg; /* argument driving the innermost while loop */
 } Gen;
 
 static void emit(Gen *g, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -98,6 +99,7 @@ static void gen_expr(Gen *g, char *out, size_t outsz)
     case 3: snprintf(out, outsz, "(%s %% %s)", a, b); break;
     case 4: snprintf(out, outsz, "(%s > %s)", a, b); break;
     case 5: snprintf(out, outsz, "(%s < %s)", a, b); break;
+    case 6: snprintf(out, outsz, "(%s / (%s + %d))", a, b, 1 + (int)rnd(9)); break;
     default: snprintf(out, outsz, "(%s === %s)", a, b); break;
     }
 }
@@ -107,7 +109,7 @@ static void gen_block(Gen *g);
 static void gen_stmt(Gen *g, int in_loop)
 {
     char e[512];
-    uint32_t k = rnd(13);
+    uint32_t k = rnd(14);
 
     if (g->depth > 3) { /* keep the generator recursion bounded */
         gen_expr(g, e, sizeof(e));
@@ -144,6 +146,18 @@ static void gen_stmt(Gen *g, int in_loop)
         else if (g->args > 0)
             emit(g, "if (a%d > 0) a%d--; ", (int)rnd(g->args), (int)rnd(g->args));
         break;
+    case 12: { /* arg op= const: the n /= 2 shape */
+        char opc = "+-*/%"[rnd(5)];
+        int a = (int)rnd(g->args);
+
+        /* never grow the argument that drives the enclosing loop, it would
+         * keep the program from terminating */
+        if ((opc == '+' || opc == '*') && a == g->loop_arg && g->args > 1)
+            a = (a + 1) % g->args;
+        if (g->args > 0)
+            emit(g, "a%d %c= %d; ", a, opc, 1 + (int)rnd(7));
+        break;
+    }
     case 5: { /* if / else */
         char c[512];
         gen_expr(g, c, sizeof(c));
@@ -218,12 +232,16 @@ static void gen_stmt(Gen *g, int in_loop)
     case 10: /* while with an argument: the fib loop pattern */
         if (g->args > 0 && g->loops > 0) {
             int a = (int)rnd(g->args);
+            int save_arg = g->loop_arg;
+
             g->loops--;
+            g->loop_arg = a;
             emit(g, "while (a%d > 0) { a%d--; ", a, a);
             g->depth++;
             gen_block(g);
             g->depth--;
             emit(g, "} ");
+            g->loop_arg = save_arg;
         }
         break;
     case 11:
@@ -251,6 +269,7 @@ static const char *gen_program(uint64_t seed, char *src, size_t srcsz)
     int i;
 
     memset(&g, 0, sizeof(g));
+    g.loop_arg = -1;
     rng_state = seed | 1;
     emit(&g, "let g = 0; ");
     for (i = 0; i < 3; i++) {
