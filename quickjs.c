@@ -1589,32 +1589,35 @@ static void luna_fuse(JSFunctionBytecode *b)
             pos = q2;
             continue;
         }
-        /* arg op= const: get_arg0; push_1..7; binop; put_arg0 */
-        if (LUNA_HEAD(pos) == OP_get_arg0 && q1 == pos + 1 &&
+        /* arg op= const: get_argK; push_1..7; binop; put_argK */
+        if (LUNA_HEAD(pos) >= OP_get_arg0 && LUNA_HEAD(pos) <= OP_get_arg3 &&
+            q1 == pos + 1 &&
             LUNA_HEAD(q1) > OP_push_0 && LUNA_HEAD(q1) <= OP_push_7 &&
             q2 == q1 + 1 && luna_argop_id(LUNA_HEAD(q2)) >= 0 &&
-            q3 == q2 + 1 && LUNA_HEAD(q3) == OP_put_arg0 && q4 == q3 + 1 &&
-            luna_target_free(b, pos + 1, q4)) {
+            q3 == q2 + 1 &&
+            LUNA_HEAD(q3) == OP_put_arg0 + (LUNA_HEAD(pos) - OP_get_arg0) &&
+            q4 == q3 + 1 && luna_target_free(b, pos + 1, q4)) {
             /* capture both operands before any byte is overwritten */
             {
                 int nsel = LUNA_HEAD(q1) - OP_push_0;
                 int bsel = luna_argop_id(LUNA_HEAD(q2));
+                int arg = LUNA_HEAD(pos) - OP_get_arg0;
 
                 buf[pos + 2] = (uint8_t)nsel;
-                buf[pos + 1] = (uint8_t)bsel;
+                buf[pos + 1] = (uint8_t)(bsel * 4 + arg);
             }
             buf[pos] = LUNA_FUSED_COPY;
             buf[pos + 3] = LUNA_FV_ARGOP;
             pos = q4;
             continue;
         }
-        /* n--: get_arg0; post_dec; put_arg0 */
-        if (LUNA_HEAD(pos) == OP_get_arg0 && q1 == pos + 1 &&
-            LUNA_HEAD(q1) == OP_post_dec && q2 == q1 + 1 &&
-            LUNA_HEAD(q2) == OP_put_arg0 && q3 == q2 + 1 &&
-            luna_target_free(b, pos + 1, q3)) {
+        /* n--: get_argK; post_dec; put_argK */
+        if (LUNA_HEAD(pos) >= OP_get_arg0 && LUNA_HEAD(pos) <= OP_get_arg3 &&
+            q1 == pos + 1 && LUNA_HEAD(q1) == OP_post_dec && q2 == q1 + 1 &&
+            LUNA_HEAD(q2) == OP_put_arg0 + (LUNA_HEAD(pos) - OP_get_arg0) &&
+            q3 == q2 + 1 && luna_target_free(b, pos + 1, q3)) {
+            buf[pos + 1] = (uint8_t)(LUNA_HEAD(pos) - OP_get_arg0);
             buf[pos] = LUNA_FUSED_ARGDEC;
-            buf[pos + 1] = OP_nop;
             buf[pos + 2] = OP_nop;
             pos = q3;
             continue;
@@ -19706,12 +19709,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int sel = pc[2];
 
                 if (sel == LUNA_FV_ARGOP) {
-                    int binop = pc[0];
+                    int id = pc[0];
+                    int binop = id >> 2;
+                    int arg = id & 3;
                     int32_t n = pc[1];
                     JSValue op1, op2;
 
                     pc += 3;
-                    *sp++ = JS_DupValue(ctx, arg_buf[0]);
+                    *sp++ = JS_DupValue(ctx, arg_buf[arg]);
                     *sp++ = JS_NewInt32(ctx, n);
                     op1 = sp[-2];
                     op2 = sp[-1];
@@ -19841,7 +19846,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         break;
                     }
-                    set_value(ctx, &arg_buf[0], sp[-1]);
+                    set_value(ctx, &arg_buf[arg], sp[-1]);
                     sp--;
                 } else {
                     int x, y;
@@ -20005,23 +20010,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 *sp++ = JS_DupValue(ctx, var_buf[x]);
             }
             BREAK;
-        luna_fused_argdec: /* get_arg0; post_dec; put_arg0 */
+        luna_fused_argdec: /* get_argK; post_dec; put_argK */
             {
-                JSValue op1 = arg_buf[0];
+                int arg = pc[0];
+                JSValue op1 = arg_buf[arg];
 
                 pc += 2;
                 if (likely(JS_VALUE_GET_TAG(op1) == JS_TAG_INT &&
                            JS_VALUE_GET_INT(op1) != INT32_MIN)) {
                     int32_t v = JS_VALUE_GET_INT(op1);
 
-                    *sp++ = JS_NewInt32(ctx, v);          /* the old value */
-                    arg_buf[0] = JS_NewInt32(ctx, v - 1); /* the decremented one */
+                    *sp++ = JS_NewInt32(ctx, v);            /* the old value */
+                    arg_buf[arg] = JS_NewInt32(ctx, v - 1); /* the decremented one */
                 } else {
                     *sp++ = JS_DupValue(ctx, op1);
                     if (js_post_inc_slow(ctx, sp, OP_post_dec))
                         goto exception;
                     sp++;
-                    set_value(ctx, &arg_buf[0], sp[-1]);
+                    set_value(ctx, &arg_buf[arg], sp[-1]);
                     sp--;
                 }
             }
