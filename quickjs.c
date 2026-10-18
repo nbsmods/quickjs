@@ -711,6 +711,7 @@ typedef struct JSFunctionBytecode {
     uint8_t *luna_targets;
     int luna_targets_built;
     int luna_enc_ro;             /* luna_enc lives in read only pages */
+    struct LunaIC *luna_ic;      /* inline caches for fused property loads */
     int luna_inited;             /* one time setup done */
     /* JIT specialized table: one entry per stored opcode, carrying both the
      * canonical opcode and its handler label so the fetch is a single load */
@@ -1176,46 +1177,6 @@ static uint8_t luna_op_fmt_tab[256];
 
 
 
-#ifdef LUNA_PROF
-uint64_t luna_prof_freq[256];
-uint64_t luna_prof_pair[256][256];
-static int luna_prof_prev;
-static int luna_prof_on = -1;
-static void luna_prof_count(int op)
-{
-    if (luna_prof_on < 0)
-        luna_prof_on = getenv("LUNA_PROF") != NULL;
-    if (luna_prof_on) {
-        luna_prof_freq[op]++;
-        luna_prof_pair[luna_prof_prev][op]++;
-        luna_prof_prev = op;
-    }
-}
-static void __attribute__((destructor)) luna_prof_dump(void)
-{
-    int i, j, k, n = 0;
-    struct { uint64_t c; int a, b; } top[24], t;
-
-    if (!luna_prof_on)
-        return;
-    for (i = 0; i < 256; i++)
-        for (j = 0; j < 256; j++) {
-            if (!luna_prof_pair[i][j])
-                continue;
-            t.c = luna_prof_pair[i][j]; t.a = i; t.b = j;
-            for (k = n; k > 0 && top[k-1].c < t.c; k--)
-                top[k] = top[k-1];
-            if (k < 24) top[k] = t;
-            if (n < 24) n++;
-        }
-    for (i = 0; i < n; i++)
-        fprintf(stderr, "PAIR %d %d %llu\n", top[i].a, top[i].b,
-                (unsigned long long)top[i].c);
-}
-#define LUNA_PROF_HOOK(op) luna_prof_count (op)
-#else
-#define LUNA_PROF_HOOK(op) do { } while (0)
-#endif
 
 
 
@@ -1395,7 +1356,7 @@ LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
 #define LUNA_FUSED_INITADD   (OP_COUNT + 1) /* set_uninit t; glc x; glc y; add; put_locN */
 #define LUNA_FUSED_ADD3      (OP_COUNT + 2) /* glc x; glc y; add */
 #define LUNA_FUSED_GT0_IF    (OP_COUNT + 3) /* push_0; gt; if_false8 rel */
-#define LUNA_FUSED_UNINIT    (OP_COUNT + 4) /* set_uninit t; glc x */
+#define LUNA_FUSED_PUTF      (OP_COUNT + 4) /* put_field a, inline cached */
 #define LUNA_FUSED_ARGDEC    (OP_COUNT + 5) /* get_arg0; post_dec; put_arg0 */
 #define LUNA_FUSED_GLD       (OP_COUNT + 6) /* glc x; { get_field a | post_inc; plc y } */
 #define LUNA_FUSED_ESC       (OP_COUNT + 7) /* [ESC][payload]: an open ended
@@ -1410,6 +1371,10 @@ LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
 #define LUNA_FP_COPY2_GOTO   4 /* copy; copy; goto8 rel */
 #define LUNA_FP_ARG_GT0      5 /* get_argK; post_dec; put_argK; push_0; gt; if_false8 rel */
 #define LUNA_FP_LGT_IF       6 /* glc x; push_i8 C; lt|gt; if_false8 rel */
+#define LUNA_FP_LOC_OPC      7 /* glc x; push_i8 C; add|sub|mul */
+#define LUNA_FP_MADD         8 /* glc x; push_i8 C; mul; push_i8 D; add */
+#define LUNA_FP_MODC         9 /* push_i32 C; mod */
+#define LUNA_FP_MODC_CP      10 /* push_const C; mod */
 
 /* variant selectors, stored in a byte of the fused span that no jump can
  * reach (the interior target guard refuses such fusions) */
@@ -1564,7 +1529,9 @@ static void luna_fuse(JSFunctionBytecode *b)
          * a single size load */
         if (head != OP_set_loc_uninitialized && head != OP_get_loc_check &&
             head != OP_push_0 && head != OP_get_arg0 && head != OP_dup &&
-            head != OP_push_i8 && head != OP_push_i16) {
+            head != OP_push_i8 && head != OP_push_i16 &&
+            head != OP_push_const && head != OP_push_i32 &&
+            head != OP_put_field) {
             if (luna_op_size_tab[head] == 0)
                 break;
             pos += luna_op_size_tab[head];
@@ -1575,8 +1542,64 @@ static void luna_fuse(JSFunctionBytecode *b)
         q3 = LUNA_NEXT(q2);
         q4 = LUNA_NEXT(q3);
 
+        /* multiply and add: glc x; push_i8 C; mul; push_i8 D; add */
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
+            LUNA_HEAD(q1) == OP_push_i8 && q2 == q1 + 2 &&
+            LUNA_HEAD(q2) == OP_mul && q3 == q2 + 1 &&
+            LUNA_HEAD(q3) == OP_push_i8 && q4 == q3 + 2 &&
+            LUNA_HEAD(q4) == OP_add && q4 + 1 <= len &&
+            luna_target_free(b, pos + 1, q4 + 1)) {
+            int x = get_u16(buf + pos + 1);
+            int c = (int8_t)buf[pos + 4];
+            int d = (int8_t)buf[pos + 7];
+
+            buf[pos] = LUNA_FUSED_ESC;
+            buf[pos + 1] = LUNA_FP_MADD;
+            buf[pos + 2] = (uint8_t)(x & 0xff);
+            buf[pos + 3] = (uint8_t)(x >> 8);
+            buf[pos + 4] = (uint8_t)c;
+            buf[pos + 7] = (uint8_t)d;
+            pos = q4 + 1;
+            continue;
+        }
+        /* local op constant: glc x; push_i8 C; add|sub|mul */
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
+            LUNA_HEAD(q1) == OP_push_i8 && q2 == q1 + 2 &&
+            (LUNA_HEAD(q2) == OP_add || LUNA_HEAD(q2) == OP_sub ||
+             LUNA_HEAD(q2) == OP_mul) &&
+            q3 == q2 + 1 && luna_target_free(b, pos + 1, q3)) {
+            int x = get_u16(buf + pos + 1);
+            int c = (int8_t)buf[pos + 4];
+            int sel = (LUNA_HEAD(q2) == OP_add) ? 0
+                    : ((LUNA_HEAD(q2) == OP_sub) ? 1 : 2);
+
+            buf[pos] = LUNA_FUSED_ESC;
+            buf[pos + 1] = LUNA_FP_LOC_OPC;
+            buf[pos + 2] = (uint8_t)(x & 0xff);
+            buf[pos + 3] = (uint8_t)(x >> 8);
+            buf[pos + 4] = (uint8_t)c;
+            buf[pos + 5] = (uint8_t)sel;
+            pos = q3;
+            continue;
+        }
+        /* constant modulo: push_i32/push_const C; mod */
+        if ((head == OP_push_i32 || head == OP_push_const) &&
+            q1 == pos + 5 && LUNA_HEAD(q1) == OP_mod && q2 == q1 + 1 &&
+            luna_target_free(b, pos + 1, q2)) {
+            uint32_t c = get_u32(buf + pos + 1);
+
+            buf[pos] = LUNA_FUSED_ESC;
+            buf[pos + 1] = (head == OP_push_i32) ? LUNA_FP_MODC
+                                                           : LUNA_FP_MODC_CP;
+            buf[pos + 2] = (uint8_t)(c & 0xff);
+            buf[pos + 3] = (uint8_t)((c >> 8) & 0xff);
+            buf[pos + 4] = (uint8_t)((c >> 16) & 0xff);
+            buf[pos + 5] = (uint8_t)((c >> 24) & 0xff);
+            pos = q2;
+            continue;
+        }
         /* compare with a constant: glc x; push_i8 C; lt|gt; if_false8 rel */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_push_i8 && q2 == q1 + 2 &&
             (LUNA_HEAD(q2) == OP_lt || LUNA_HEAD(q2) == OP_gt) &&
             q3 == q2 + 1 && LUNA_HEAD(q3) == OP_if_false8 && q4 == q3 + 2 &&
@@ -1593,7 +1616,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* field add (escape payload): glc x; gf a; glc y; gf b; add */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_get_field && q2 == q1 + 5 &&
             LUNA_HEAD(q2) == OP_get_loc_check && q3 == q2 + 3 &&
             LUNA_HEAD(q3) == OP_get_field && q4 == q3 + 5 &&
@@ -1612,7 +1635,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* const init: set_loc_uninitialized t; glc x; glc y; add; put_locN */
-        if (LUNA_HEAD(pos) == OP_set_loc_uninitialized && q1 == pos + 3 &&
+        if (head == OP_set_loc_uninitialized && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
             LUNA_HEAD(q2) == OP_get_loc_check && q3 == q2 + 3 &&
             LUNA_HEAD(q3) == OP_add && q3 + 1 < len &&
@@ -1628,7 +1651,7 @@ static void luna_fuse(JSFunctionBytecode *b)
         }
         /* two copies, optionally followed by the loop back edge. The chained
          * forms run two or three old dispatches as one. */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_dup && q2 == q1 + 1 &&
             LUNA_HEAD(q2) == OP_put_loc_check && q3 == q2 + 3 &&
             LUNA_HEAD(q3) == OP_drop) {
@@ -1669,7 +1692,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             }
         }
         /* copy: glc x; dup; put_loc_check y; drop */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_dup && q2 == q1 + 1 &&
             LUNA_HEAD(q2) == OP_put_loc_check && q3 == q2 + 3 &&
             LUNA_HEAD(q3) == OP_drop && q4 == q3 + 1 &&
@@ -1682,7 +1705,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* comparison guard: glc x; glc y; lt; if_false8 rel */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
             LUNA_HEAD(q2) == OP_lt && q3 == q2 + 1 &&
             LUNA_HEAD(q3) == OP_if_false8 && q4 == q3 + 2 &&
@@ -1695,7 +1718,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* comparison: glc x; glc y; lt */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
             LUNA_HEAD(q2) == OP_lt && q3 == q2 + 1 &&
             luna_target_free(b, pos + 1, q3)) {
@@ -1706,7 +1729,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* binary op on two locals: glc x; glc y; add/sub/mul */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
             (LUNA_HEAD(q2) == OP_add || LUNA_HEAD(q2) == OP_sub ||
              LUNA_HEAD(q2) == OP_mul) &&
@@ -1720,7 +1743,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* loop condition: push_0; gt; if_false8 rel */
-        if (LUNA_HEAD(pos) == OP_push_0 && q1 == pos + 1 &&
+        if (head == OP_push_0 && q1 == pos + 1 &&
             LUNA_HEAD(q1) == OP_gt && q2 == q1 + 1 &&
             LUNA_HEAD(q2) == OP_if_false8 && q3 == q2 + 2 &&
             luna_target_free(b, pos + 1, q3)) {
@@ -1731,7 +1754,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* field load: glc x; get_field a */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_get_field && q2 == q1 + 5 &&
             luna_target_free(b, pos + 1, q2)) {
             buf[pos] = LUNA_FUSED_GLD;
@@ -1740,7 +1763,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* post increment: glc x; post_inc; put_loc_check y */
-        if (LUNA_HEAD(pos) == OP_get_loc_check && q1 == pos + 3 &&
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
             LUNA_HEAD(q1) == OP_post_inc && q2 == q1 + 1 &&
             LUNA_HEAD(q2) == OP_put_loc_check && q3 == q2 + 3 &&
             luna_target_free(b, pos + 1, q3)) {
@@ -1751,11 +1774,11 @@ static void luna_fuse(JSFunctionBytecode *b)
             continue;
         }
         /* loop bound (escape payload): push_i8/i16 C; lt; if_false8 rel */
-        if ((LUNA_HEAD(pos) == OP_push_i8 || LUNA_HEAD(pos) == OP_push_i16) &&
+        if ((head == OP_push_i8 || head == OP_push_i16) &&
             LUNA_HEAD(q1) == OP_lt && q2 == q1 + 1 &&
             LUNA_HEAD(q2) == OP_if_false8 && q3 == q2 + 2 &&
             luna_target_free(b, pos + 1, q3)) {
-            int is8 = (LUNA_HEAD(pos) == OP_push_i8);
+            int is8 = (head == OP_push_i8);
             int c = is8 ? (int8_t)buf[pos + 1]
                         : (int)(int16_t)get_u16(buf + pos + 1);
 
@@ -1773,18 +1796,17 @@ static void luna_fuse(JSFunctionBytecode *b)
             pos = q3;
             continue;
         }
-        /* tdz init: set_loc_uninitialized t; glc x */
-        if (LUNA_HEAD(pos) == OP_set_loc_uninitialized && q1 == pos + 3 &&
-            LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
-            luna_target_free(b, pos + 1, q2)) {
-            buf[pos] = LUNA_FUSED_UNINIT;
-            buf[pos + 3] = OP_nop;
-            pos = q2;
+        /* property store: put_field a, inline cached. The opcode replaces
+         * put_field in place, the atom stays where it is. */
+        if (head == OP_put_field && q1 == pos + 5 &&
+            luna_target_free(b, pos + 1, q1)) {
+            buf[pos] = LUNA_FUSED_PUTF;
+            pos = q1;
             continue;
         }
         /* store: dup; put_loc_check y; drop (the assignment statement of an
          * expression result, the let/const write after any computation) */
-        if (LUNA_HEAD(pos) == OP_dup && q1 == pos + 1 &&
+        if (head == OP_dup && q1 == pos + 1 &&
             LUNA_HEAD(q1) == OP_put_loc_check && q2 == q1 + 3 &&
             LUNA_HEAD(q2) == OP_drop && q3 == q2 + 1 &&
             luna_target_free(b, pos + 1, q3)) {
@@ -6253,6 +6275,104 @@ static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
     return NULL;
 }
 
+/*
+ * Inline cache for property loads in fused handlers. Shapes are immutable
+ * snapshots of (prototype, property set), so a shape pointer match means the
+ * property sits at the same slot with the same flags; the entry keeps a
+ * shape reference. Only plain class objects with own normal data properties
+ * are cached.
+ */
+typedef struct LunaIC {
+    JSShape *shape;
+    JSAtom atom;
+    int slot;
+} LunaIC;
+
+#define LUNA_IC_COUNT 32
+
+/* IC fast path: 0 and *out set on hit, -1 on miss. */
+LUNA_INLINE int luna_ic_get(JSContext *ctx, JSValue obj, JSAtom atom,
+                            LunaIC *ic, JSValue *out)
+{
+    JSObject *p;
+
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        if (likely(p->shape == ic->shape && ic->shape != NULL &&
+                   p->class_id == JS_CLASS_OBJECT &&
+                   !p->is_exotic && !p->fast_array)) {
+            JSShapeProperty *pr = &get_shape_prop(p->shape)[ic->slot];
+
+            if (likely(pr->atom == atom &&
+                       (pr->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)) {
+                *out = JS_DupValue(ctx, p->prop[ic->slot].u.value);
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/*
+ * IC store path for put_field. Only an own, writable, normal data property
+ * of a plain object is set directly, which is exactly what the ordinary
+ * [[Set]] would do for it (no prototype walk happens when the receiver has
+ * its own data property). 0 on hit, -1 on miss; consumes val on hit.
+ */
+LUNA_INLINE int luna_ic_set(JSContext *ctx, JSValue obj, JSAtom atom,
+                            JSValue val, LunaIC *ic)
+{
+    JSObject *p;
+
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        if (likely(p->shape == ic->shape && ic->shape != NULL &&
+                   p->class_id == JS_CLASS_OBJECT &&
+                   !p->is_exotic && !p->fast_array)) {
+            JSShapeProperty *pr = &get_shape_prop(p->shape)[ic->slot];
+
+            if (likely(pr->atom == atom &&
+                       (pr->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
+                           (JS_PROP_NORMAL | JS_PROP_WRITABLE))) {
+                JSProperty *pp = &p->prop[ic->slot];
+                JSValue old = pp->u.value;
+
+                pp->u.value = val;
+                JS_FreeValue(ctx, old);
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Slow path completed: remember the site when it is a simple own property. */
+static void luna_ic_update(JSContext *ctx, JSValue obj, JSAtom atom, LunaIC *ic)
+{
+    JSObject *p;
+    JSShapeProperty *found, *base;
+    int idx;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_OBJECT || p->is_exotic || p->fast_array)
+        return;
+    base = get_shape_prop(p->shape);
+    found = find_own_property1(p, atom);
+    if (!found || (found->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return;
+    idx = (int)(found - base);
+    if (ic->shape != p->shape) {
+        JSShape *ns = js_dup_shape(p->shape);
+
+        if (ic->shape)
+            js_free_shape(ctx->rt, ic->shape);
+        ic->shape = ns;
+    }
+    ic->slot = idx;
+}
+
 /* indicate that the object may be part of a function prototype cycle */
 static void set_cycle_flag(JSContext *ctx, JSValueConst obj)
 {
@@ -6678,6 +6798,14 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             }
             if (b->realm)
                 mark_func(rt, &b->realm->header);
+            /* inline caches hold shape references: make them visible to
+             * both the mark and the decref pass */
+            if (b->luna_ic) {
+                for (i = 0; i < LUNA_IC_COUNT; i++) {
+                    if (b->luna_ic[i].shape)
+                        mark_func(rt, &b->luna_ic[i].shape->header);
+                }
+            }
         }
         break;
     case JS_GC_OBJ_TYPE_VAR_REF:
@@ -17314,7 +17442,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         [ LUNA_FUSED_INITADD ] = &&luna_fused_initadd,
         [ LUNA_FUSED_ADD3 ] = &&luna_fused_add3,
         [ LUNA_FUSED_GT0_IF ] = &&luna_fused_gt0_if,
-        [ LUNA_FUSED_UNINIT ] = &&luna_fused_uninit,
+        [ LUNA_FUSED_PUTF ] = &&luna_fused_putf,
         [ LUNA_FUSED_ARGDEC ] = &&luna_fused_argdec,
         [ LUNA_FUSED_GLD ] = &&luna_fused_gld,
         [ LUNA_FUSED_ESC ] = &&luna_fused_esc
@@ -17506,6 +17634,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 }
                 memset (b->luna_targets, 0, b->byte_code_len / 8 + 1);
+                b->luna_ic = js_malloc(ctx, LUNA_IC_COUNT * sizeof(*b->luna_ic));
+                if (unlikely (!b->luna_ic)) {
+                    luna_enc_release(b->luna_enc, b->byte_code_len,
+                                     b->luna_enc_ro);
+                    js_free(ctx, b->luna_targets);
+                    b->luna_enc = NULL;
+                    b->luna_targets = NULL;
+                    JS_ThrowOutOfMemory (ctx);
+                    goto exception;
+                }
+                memset (b->luna_ic, 0, LUNA_IC_COUNT * sizeof(*b->luna_ic));
             } else {
                 /*
                  * Window bookkeeping, shared by every activation: the pool
@@ -20354,19 +20493,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
             }
             BREAK;
-        luna_fused_uninit: /* set_uninit t; glc x */
+        luna_fused_putf: /* put_field a, inline cached */
             {
-                int t, x;
+                JSAtom atom = get_u32(pc);
+                uint32_t site = (uint32_t)(pc - b->byte_code_buf - 1);
+                uint32_t aslot = (site >> 1) & (LUNA_IC_COUNT - 1);
+                LunaIC *ic;
+                int ret;
 
-                t = get_u16(pc);
-                x = get_u16(pc + 3);
-                pc += 5;
-                set_value(ctx, &var_buf[t], JS_UNINITIALIZED);
-                if (unlikely(JS_IsUninitialized(var_buf[x]))) {
-                    JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
-                    goto exception;
+                pc += 4;
+                ic = &b->luna_ic[aslot];
+                if (unlikely(luna_ic_set(ctx, sp[-2], atom, sp[-1], ic) < 0)) {
+                    /* reads and writes must not evict each other, so try a
+                     * slot from the other half of the table as well */
+                    ic = &b->luna_ic[(aslot + 16) & (LUNA_IC_COUNT - 1)];
+                    if (unlikely(luna_ic_set(ctx, sp[-2], atom, sp[-1], ic) < 0)) {
+                        ret = JS_SetPropertyInternal(ctx, sp[-2], atom,
+                                                     sp[-1], sp[-2],
+                                                     JS_PROP_THROW_STRICT);
+                        if (unlikely(ret < 0)) {
+                            JS_FreeValue(ctx, sp[-2]);
+                            sp -= 2;
+                            goto exception;
+                        }
+                        luna_ic_update(ctx, sp[-2], atom, ic);
+                    }
                 }
-                *sp++ = JS_DupValue(ctx, var_buf[x]);
+                JS_FreeValue(ctx, sp[-2]);
+                sp -= 2;
             }
             BREAK;
         luna_fused_argdec: /* get_argK; post_dec; put_argK */
@@ -20433,6 +20587,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 } else {
                     JSAtom atom = get_u32(pc + 3);
+                    uint32_t site = (uint32_t)(pc - b->byte_code_buf - 1);
                     JSValue val;
 
                     pc += 7;
@@ -20441,9 +20596,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     }
                     *sp++ = JS_DupValue(ctx, var_buf[x]);
-                    val = JS_GetProperty(ctx, sp[-1], atom);
-                    if (unlikely(JS_IsException(val)))
-                        goto exception;
+                    {
+                        LunaIC *ic = &b->luna_ic[(site >> 1) & (LUNA_IC_COUNT - 1)];
+
+                        if (unlikely(luna_ic_get(ctx, sp[-1], atom, ic, &val) < 0)) {
+                            val = JS_GetProperty(ctx, sp[-1], atom);
+                            if (unlikely(JS_IsException(val)))
+                                goto exception;
+                            luna_ic_update(ctx, sp[-1], atom, ic);
+                        }
+                    }
                     JS_FreeValue(ctx, sp[-1]);
                     sp[-1] = val;
                 }
@@ -20457,6 +20619,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 case LUNA_FP_FLDADD:
                     {
                         int x, y;
+                        uint32_t site;
                         JSAtom aatom, batom;
                         JSValue val;
 
@@ -20464,15 +20627,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         aatom = get_u32(pc + 3);
                         y = get_u16(pc + 8);
                         batom = get_u32(pc + 11);
+                        site = (uint32_t)(pc - b->byte_code_buf - 1);
                         pc += 16;
                         if (unlikely(JS_IsUninitialized(var_buf[x]))) {
                             JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
                             goto exception;
                         }
                         *sp++ = JS_DupValue(ctx, var_buf[x]);
-                        val = JS_GetProperty(ctx, sp[-1], aatom);
-                        if (unlikely(JS_IsException(val)))
-                            goto exception;
+                        {
+                            LunaIC *ic = &b->luna_ic[(site >> 1) & (LUNA_IC_COUNT - 1)];
+
+                            if (unlikely(luna_ic_get(ctx, sp[-1], aatom, ic, &val) < 0)) {
+                                val = JS_GetProperty(ctx, sp[-1], aatom);
+                                if (unlikely(JS_IsException(val)))
+                                    goto exception;
+                                luna_ic_update(ctx, sp[-1], aatom, ic);
+                            }
+                        }
                         JS_FreeValue(ctx, sp[-1]);
                         sp[-1] = val;
                         if (unlikely(JS_IsUninitialized(var_buf[y]))) {
@@ -20480,9 +20651,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto exception;
                         }
                         *sp++ = JS_DupValue(ctx, var_buf[y]);
-                        val = JS_GetProperty(ctx, sp[-1], batom);
-                        if (unlikely(JS_IsException(val)))
-                            goto exception;
+                        {
+                            LunaIC *ic = &b->luna_ic[((site + 8) >> 1) & (LUNA_IC_COUNT - 1)];
+
+                            if (unlikely(luna_ic_get(ctx, sp[-1], batom, ic, &val) < 0)) {
+                                val = JS_GetProperty(ctx, sp[-1], batom);
+                                if (unlikely(JS_IsException(val)))
+                                    goto exception;
+                                luna_ic_update(ctx, sp[-1], batom, ic);
+                            }
+                        }
                         JS_FreeValue(ctx, sp[-1]);
                         sp[-1] = val;
                         {
@@ -20589,6 +20767,206 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             pc += rel - 1;
                             if (unlikely(js_poll_interrupts(ctx)))
                                 goto exception;
+                        }
+                    }
+                    break;
+                case LUNA_FP_LOC_OPC:
+                    {
+                        int x, c, sel;
+                        JSValue a, b2;
+
+                        x = (int)(pc[1] | ((uint32_t)pc[2] << 8));
+                        c = (int8_t)pc[3];
+                        sel = pc[4];
+                        pc += 5;
+                        if (unlikely(JS_IsUninitialized(var_buf[x]))) {
+                            JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
+                            goto exception;
+                        }
+                        *sp++ = JS_DupValue(ctx, var_buf[x]);
+                        *sp++ = JS_NewInt32(ctx, c);
+                        a = sp[-2];
+                        b2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(a, b2))) {
+                            int64_t r;
+                            int32_t v1 = JS_VALUE_GET_INT(a);
+                            int32_t v2 = JS_VALUE_GET_INT(b2);
+
+                            switch (sel) {
+                            case 0:
+                                r = (int64_t)v1 + v2;
+                                if (unlikely((int)r != r))
+                                    goto luna_lopc_slow;
+                                sp[-2] = JS_NewInt32(ctx, (int)r);
+                                break;
+                            case 1:
+                                r = (int64_t)v1 - v2;
+                                if (unlikely((int)r != r))
+                                    goto luna_lopc_slow;
+                                sp[-2] = JS_NewInt32(ctx, (int)r);
+                                break;
+                            default:
+                                {
+                                    double d;
+
+                                    r = (int64_t)v1 * v2;
+                                    if (unlikely((int)r != r)) {
+#ifdef CONFIG_BIGNUM
+                                        if (unlikely(sf->js_mode & JS_MODE_MATH) &&
+                                            (r < -MAX_SAFE_INTEGER ||
+                                             r > MAX_SAFE_INTEGER))
+                                            goto luna_lopc_slow;
+#endif
+                                        d = (double)r;
+                                        goto luna_lopc_fp;
+                                    }
+                                    if (unlikely(r == 0 && (v1 | v2) < 0)) {
+                                        d = -0.0;
+                                        goto luna_lopc_fp;
+                                    }
+                                    sp[-2] = JS_NewInt32(ctx, (int)r);
+                                }
+                                break;
+                            }
+                            sp--;
+                        } else if (sel == 2 && JS_VALUE_IS_BOTH_FLOAT(a, b2)) {
+                            double d;
+
+#ifdef CONFIG_BIGNUM
+                            if (unlikely(sf->js_mode & JS_MODE_MATH))
+                                goto luna_lopc_slow;
+#endif
+                            d = JS_VALUE_GET_FLOAT64(a) * JS_VALUE_GET_FLOAT64(b2);
+                        luna_lopc_fp:
+                            sp[-2] = __JS_NewFloat64(ctx, d);
+                            sp--;
+                        } else if (sel == 0 && JS_VALUE_IS_BOTH_FLOAT(a, b2)) {
+                            sp[-2] = __JS_NewFloat64(ctx,
+                                JS_VALUE_GET_FLOAT64(a) + JS_VALUE_GET_FLOAT64(b2));
+                            sp--;
+                        } else if (sel == 1 && JS_VALUE_IS_BOTH_FLOAT(a, b2)) {
+                            sp[-2] = __JS_NewFloat64(ctx,
+                                JS_VALUE_GET_FLOAT64(a) - JS_VALUE_GET_FLOAT64(b2));
+                            sp--;
+                        } else {
+                        luna_lopc_slow:
+                            if (sel == 0 ? js_add_slow(ctx, sp)
+                                         : js_binary_arith_slow(ctx, sp,
+                                               sel == 1 ? OP_sub : OP_mul))
+                                goto exception;
+                            sp--;
+                        }
+                    }
+                    break;
+                case LUNA_FP_MADD:
+                    {
+                        int x, c, d;
+                        JSValue a, b2;
+
+                        x = (int)(pc[1] | ((uint32_t)pc[2] << 8));
+                        c = (int8_t)pc[3];
+                        d = (int8_t)pc[6];
+                        pc += 8;
+                        if (unlikely(JS_IsUninitialized(var_buf[x]))) {
+                            JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
+                            goto exception;
+                        }
+                        *sp++ = JS_DupValue(ctx, var_buf[x]);
+                        *sp++ = JS_NewInt32(ctx, c);
+                        a = sp[-2];
+                        b2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(a, b2))) {
+                            int64_t r = (int64_t)JS_VALUE_GET_INT(a) *
+                                        JS_VALUE_GET_INT(b2);
+
+                            if (unlikely((int)r != r)) {
+#ifdef CONFIG_BIGNUM
+                                if (unlikely(sf->js_mode & JS_MODE_MATH) &&
+                                    (r < -MAX_SAFE_INTEGER ||
+                                     r > MAX_SAFE_INTEGER))
+                                    goto luna_madd_slow;
+#endif
+                                sp[-2] = __JS_NewFloat64(ctx, (double)r);
+                                sp--;
+                                goto luna_madd_second;
+                            }
+                            if (unlikely(r == 0 &&
+                                         (JS_VALUE_GET_INT(a) |
+                                          JS_VALUE_GET_INT(b2)) < 0)) {
+                                sp[-2] = __JS_NewFloat64(ctx, -0.0);
+                                sp--;
+                                goto luna_madd_second;
+                            }
+                            sp[-2] = JS_NewInt32(ctx, (int)r);
+                            sp--;
+                        } else if (JS_VALUE_IS_BOTH_FLOAT(a, b2)) {
+#ifdef CONFIG_BIGNUM
+                            if (unlikely(sf->js_mode & JS_MODE_MATH))
+                                goto luna_madd_slow;
+#endif
+                            sp[-2] = __JS_NewFloat64(ctx,
+                                JS_VALUE_GET_FLOAT64(a) * JS_VALUE_GET_FLOAT64(b2));
+                            sp--;
+                        } else {
+                        luna_madd_slow:
+                            if (js_binary_arith_slow(ctx, sp, OP_mul))
+                                goto exception;
+                            sp--;
+                        }
+                    luna_madd_second:
+                        *sp++ = JS_NewInt32(ctx, d);
+                        a = sp[-2];
+                        b2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(a, b2))) {
+                            int64_t r = (int64_t)JS_VALUE_GET_INT(a) +
+                                        JS_VALUE_GET_INT(b2);
+
+                            if (unlikely((int)r != r))
+                                goto luna_madd_slow2;
+                            sp[-2] = JS_NewInt32(ctx, (int)r);
+                            sp--;
+                        } else if (JS_VALUE_IS_BOTH_FLOAT(a, b2)) {
+                            sp[-2] = __JS_NewFloat64(ctx,
+                                JS_VALUE_GET_FLOAT64(a) + JS_VALUE_GET_FLOAT64(b2));
+                            sp--;
+                        } else {
+                        luna_madd_slow2:
+                            if (js_add_slow(ctx, sp))
+                                goto exception;
+                            sp--;
+                        }
+                    }
+                    break;
+                case LUNA_FP_MODC:
+                case LUNA_FP_MODC_CP:
+                    {
+                        uint32_t c;
+                        JSValue a, b2;
+
+                        c = (uint32_t)pc[1] | ((uint32_t)pc[2] << 8) |
+                            ((uint32_t)pc[3] << 16) | ((uint32_t)pc[4] << 24);
+                        pc += 5;
+                        if (fp == LUNA_FP_MODC)
+                            *sp++ = JS_NewInt32(ctx, (int32_t)c);
+                        else
+                            *sp++ = JS_DupValue(ctx, b->cpool[c]);
+                        a = sp[-2];
+                        b2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(a, b2))) {
+                            int v1 = JS_VALUE_GET_INT(a);
+                            int v2 = JS_VALUE_GET_INT(b2);
+                            int r;
+
+                            if (unlikely(v1 < 0 || v2 <= 0))
+                                goto luna_modc_slow;
+                            r = v1 % v2;
+                            sp[-2] = JS_NewInt32(ctx, r);
+                            sp--;
+                        } else {
+                        luna_modc_slow:
+                            if (js_binary_arith_slow(ctx, sp, OP_mod))
+                                goto exception;
+                            sp--;
                         }
                     }
                     break;
@@ -35635,11 +36013,23 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
         js_free_rt(rt, b->luna_used);
         luna_enc_release(b->luna_enc, b->byte_code_len, b->luna_enc_ro);
         js_free_rt(rt, b->luna_targets);
+        if (b->luna_ic) {
+            int luna_ici;
+
+            for (luna_ici = 0; luna_ici < LUNA_IC_COUNT; luna_ici++) {
+                if (b->luna_ic[luna_ici].shape) {
+                    fprintf(stderr, "REL %p\n", (void *)b->luna_ic[luna_ici].shape);
+                    js_free_shape(rt, b->luna_ic[luna_ici].shape);
+                }
+            }
+            js_free_rt(rt, b->luna_ic);
+        }
         b->luna_dec = NULL;
         b->luna_free = NULL;
         b->luna_used = NULL;
         b->luna_enc = NULL;
         b->luna_targets = NULL;
+        b->luna_ic = NULL;
         b->luna_dec_cap = 0;
         b->luna_free_n = 0;
         b->luna_used_n = 0;
