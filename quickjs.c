@@ -1245,6 +1245,8 @@ static void luna_enc_release(uint8_t *p, uint32_t len, int readonly)
     }
 }
 
+
+
 /*
  * Decoded window. Instructions are decoded in place one window at a time: a
  * window is a contiguous byte range of the opcode stream that is temporarily
@@ -1375,6 +1377,7 @@ LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
 #define LUNA_FP_MADD         8 /* glc x; push_i8 C; mul; push_i8 D; add */
 #define LUNA_FP_MODC         9 /* push_i32 C; mod */
 #define LUNA_FP_MODC_CP      10 /* push_const C; mod */
+#define LUNA_FP_ADDMODC      11 /* glc x; glc y; add; push_i32 C; mod */
 
 /* variant selectors, stored in a byte of the fused span that no jump can
  * reach (the interior target guard refuses such fusions) */
@@ -1580,6 +1583,27 @@ static void luna_fuse(JSFunctionBytecode *b)
             buf[pos + 4] = (uint8_t)c;
             buf[pos + 5] = (uint8_t)sel;
             pos = q3;
+            continue;
+        }
+        /* sum then modulo: glc x; glc y; add; push_i32 C; mod */
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
+            LUNA_HEAD(q1) == OP_get_loc_check && q2 == q1 + 3 &&
+            LUNA_HEAD(q2) == OP_add && q3 == q2 + 1 &&
+            LUNA_HEAD(q3) == OP_push_i32 && q4 == q3 + 5 &&
+            LUNA_HEAD(q4) == OP_mod && q4 + 1 <= len &&
+            luna_target_free(b, pos + 1, q4 + 1)) {
+            int x = get_u16(buf + pos + 1);
+            uint32_t c = get_u32(buf + pos + 8);
+
+            buf[pos] = LUNA_FUSED_ESC;
+            buf[pos + 1] = LUNA_FP_ADDMODC;
+            buf[pos + 2] = (uint8_t)(x & 0xff);
+            buf[pos + 3] = (uint8_t)(x >> 8);
+            buf[pos + 6] = OP_nop;
+            buf[pos + 7] = OP_nop;
+            buf[pos + 12] = OP_nop;
+            (void)c;
+            pos = q4 + 1;
             continue;
         }
         /* constant modulo: push_i32/push_const C; mod */
@@ -20930,6 +20954,68 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         } else {
                         luna_madd_slow2:
                             if (js_add_slow(ctx, sp))
+                                goto exception;
+                            sp--;
+                        }
+                    }
+                    break;
+                case LUNA_FP_ADDMODC:
+                    {
+                        int x, y;
+                        uint32_t c;
+                        JSValue a, b2;
+
+                        x = (int)(pc[1] | ((uint32_t)pc[2] << 8));
+                        y = get_u16(pc + 3);
+                        c = (uint32_t)pc[7] | ((uint32_t)pc[8] << 8) |
+                            ((uint32_t)pc[9] << 16) | ((uint32_t)pc[10] << 24);
+                        pc += 12;
+                        if (unlikely(JS_IsUninitialized(var_buf[x]))) {
+                            JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
+                            goto exception;
+                        }
+                        *sp++ = JS_DupValue(ctx, var_buf[x]);
+                        if (unlikely(JS_IsUninitialized(var_buf[y]))) {
+                            JS_ThrowReferenceErrorUninitialized2(ctx, b, y, FALSE);
+                            goto exception;
+                        }
+                        *sp++ = JS_DupValue(ctx, var_buf[y]);
+                        a = sp[-2];
+                        b2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(a, b2))) {
+                            int64_t r = (int64_t)JS_VALUE_GET_INT(a) +
+                                        JS_VALUE_GET_INT(b2);
+
+                            if (unlikely((int)r != r))
+                                goto luna_addmodc_slow;
+                            sp[-2] = JS_NewInt32(ctx, (int)r);
+                            sp--;
+                        } else if (JS_VALUE_IS_BOTH_FLOAT(a, b2)) {
+                            sp[-2] = __JS_NewFloat64(ctx,
+                                JS_VALUE_GET_FLOAT64(a) + JS_VALUE_GET_FLOAT64(b2));
+                            sp--;
+                        } else {
+                        luna_addmodc_slow:
+                            if (js_add_slow(ctx, sp))
+                                goto exception;
+                            sp--;
+                        }
+                        *sp++ = JS_NewInt32(ctx, (int32_t)c);
+                        a = sp[-2];
+                        b2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(a, b2))) {
+                            int v1 = JS_VALUE_GET_INT(a);
+                            int v2 = JS_VALUE_GET_INT(b2);
+                            int r;
+
+                            if (unlikely(v1 < 0 || v2 <= 0))
+                                goto luna_addmodc_slow2;
+                            r = v1 % v2;
+                            sp[-2] = JS_NewInt32(ctx, r);
+                            sp--;
+                        } else {
+                        luna_addmodc_slow2:
+                            if (js_binary_arith_slow(ctx, sp, OP_mod))
                                 goto exception;
                             sp--;
                         }
