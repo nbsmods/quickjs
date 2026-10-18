@@ -17500,12 +17500,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     &b->luna_dispatch[luna_slot_i];                     \
                                                                         \
                 opcode = (int)luna_d->op;                               \
-                LUNA_PROF_HOOK (opcode);                                \
                 goto *luna_d->label;                                    \
             }                                                           \
         }                                                               \
         opcode = *pc++;                                                 \
-        LUNA_PROF_HOOK (opcode);                                        \
         goto *dispatch_table[opcode];                                   \
     }
 #define CASE(op)        case_ ## op
