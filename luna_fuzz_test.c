@@ -271,6 +271,24 @@ static void gen_stmt(Gen *g, int in_loop)
         gen_expr(g, e, sizeof(e));
         emit(g, "o.%c = %s; ", "abc"[rnd(3)], e);
         break;
+    case 15: /* loop bounded by an argument: glc; get_arg; lt; if_false8 */
+        if (g->args > 0 && g->loops > 0) {
+            int save_arg = g->loop_arg;
+
+            /* a1 is always called with a small bound, so this terminates as
+             * long as the body cannot grow it */
+            g->loops--;
+            g->loop_arg = 1;
+            emit(g, "for (let i%d = 0; i%d < a1; i%d++) { ",
+                 g->vars, g->vars, g->vars);
+            g->vars++;
+            g->depth++;
+            gen_block(g);
+            g->depth--;
+            emit(g, "} ");
+            g->loop_arg = save_arg;
+        }
+        break;
     default:
         gen_expr(g, e, sizeof(e));
         emit(g, "g = %s; ", e);

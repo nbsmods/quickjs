@@ -728,6 +728,11 @@ typedef struct JSFunctionBytecode {
     uint32_t luna_atom_count;
     uint32_t luna_atom_cap;
     uint32_t luna_cpool_count;   /* size of the permuted constant pool */
+    /* Luna JIT: native code compiled from the canonical stream on first call.
+     * The code is generated and cached transiently; the bytecode container
+     * still holds only the keyed encoding. */
+    struct LunaJit *luna_jit;
+    uint8_t luna_jit_attempted;  /* compilation already tried */
     struct {
         /* debug info, move to separate structure to save memory? */
         JSAtom filename;
@@ -743,6 +748,24 @@ struct LunaDispatchEntry {
     uint32_t op;
     const void *label;
 };
+
+/*
+ * Luna JIT ABI. Generated code receives a pointer to this structure in x0 and
+ * returns 0 on normal completion, 1 on a deoptimisation bail (the interpreter
+ * resumes at bail_pc with bail_depth operand stack values), or 2 when the
+ * interrupt poll raised an exception.
+ */
+typedef struct LunaJitArgs {
+    JSContext *ctx;       /* 0 */
+    JSValue *vars;        /* 8 */
+    JSValue *args;        /* 16 */
+    JSValue *stack;       /* 24 */
+    JSValue ret;          /* 32 (payload), 40 (tag) */
+    uint32_t bail_pc;     /* 48 */
+    uint32_t bail_depth;  /* 52 */
+    void *poll_fn;        /* 56: luna_jit_poll, kept out of the code image */
+    void *mod_fn;         /* 64: luna_jit_fmod, kept out of the code image */
+} LunaJitArgs;
 
 typedef struct JSBoundFunction {
     JSValue func_obj;
@@ -1378,6 +1401,9 @@ LUNA_INLINE void luna_restore_range(JSFunctionBytecode *b, LunaDecRange *r)
 #define LUNA_FP_MODC         9 /* push_i32 C; mod */
 #define LUNA_FP_MODC_CP      10 /* push_const C; mod */
 #define LUNA_FP_ADDMODC      11 /* glc x; glc y; add; push_i32 C; mod */
+#define LUNA_FP_LARGLT       12 /* glc x; get_argK; lt|gt; if_false8 rel */
+#define LUNA_FP_LGT16_IF     13 /* glc x; push_i16 C; lt|gt; if_false8 rel */
+#define LUNA_FP_DROP_GOTO    14 /* drop; goto8 rel */
 
 /* variant selectors, stored in a byte of the fused span that no jump can
  * reach (the interior target guard refuses such fusions) */
@@ -1534,7 +1560,7 @@ static void luna_fuse(JSFunctionBytecode *b)
             head != OP_push_0 && head != OP_get_arg0 && head != OP_dup &&
             head != OP_push_i8 && head != OP_push_i16 &&
             head != OP_push_const && head != OP_push_i32 &&
-            head != OP_put_field) {
+            head != OP_put_field && head != OP_drop) {
             if (luna_op_size_tab[head] == 0)
                 break;
             pos += luna_op_size_tab[head];
@@ -1619,6 +1645,51 @@ static void luna_fuse(JSFunctionBytecode *b)
             buf[pos + 3] = (uint8_t)((c >> 8) & 0xff);
             buf[pos + 4] = (uint8_t)((c >> 16) & 0xff);
             buf[pos + 5] = (uint8_t)((c >> 24) & 0xff);
+            pos = q2;
+            continue;
+        }
+        /* compare local with argument: glc x; get_argK; lt|gt; if_false8 */
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
+            LUNA_HEAD(q1) >= OP_get_arg0 && LUNA_HEAD(q1) <= OP_get_arg3 &&
+            q2 == q1 + 1 &&
+            (LUNA_HEAD(q2) == OP_lt || LUNA_HEAD(q2) == OP_gt) &&
+            q3 == q2 + 1 && LUNA_HEAD(q3) == OP_if_false8 && q4 == q3 + 2 &&
+            luna_target_free(b, pos + 1, q4)) {
+            int x = get_u16(buf + pos + 1);
+            int cmpid = (LUNA_HEAD(q2) == OP_lt) ? 0 : 1;
+            int arg = LUNA_HEAD(q1) - OP_get_arg0;
+
+            buf[pos] = LUNA_FUSED_ESC;
+            buf[pos + 1] = LUNA_FP_LARGLT;
+            buf[pos + 2] = (uint8_t)(x & 0xff);
+            buf[pos + 3] = (uint8_t)(x >> 8);
+            buf[pos + 4] = (uint8_t)cmpid;
+            buf[pos + 5] = (uint8_t)arg;
+            pos = q4;
+            continue;
+        }
+        /* compare with an i16 constant: glc x; push_i16 C; lt|gt; if_false8 */
+        if (head == OP_get_loc_check && q1 == pos + 3 &&
+            LUNA_HEAD(q1) == OP_push_i16 && q2 == q1 + 3 &&
+            (LUNA_HEAD(q2) == OP_lt || LUNA_HEAD(q2) == OP_gt) &&
+            q3 == q2 + 1 && LUNA_HEAD(q3) == OP_if_false8 && q4 == q3 + 2 &&
+            luna_target_free(b, pos + 1, q4)) {
+            int x = get_u16(buf + pos + 1);
+
+            buf[pos] = LUNA_FUSED_ESC;
+            buf[pos + 1] = LUNA_FP_LGT16_IF;
+            buf[pos + 2] = (uint8_t)(x & 0xff);
+            buf[pos + 3] = (uint8_t)(x >> 8);
+            buf[pos + 6] = (uint8_t)(LUNA_HEAD(q2) == OP_lt ? 0 : 1);
+            pos = q4;
+            continue;
+        }
+        /* loop latch tail: drop; goto8 rel */
+        if (head == OP_drop && q1 == pos + 1 &&
+            LUNA_HEAD(q1) == OP_goto8 && q2 == q1 + 2 &&
+            luna_target_free(b, pos + 1, q2)) {
+            buf[pos] = LUNA_FUSED_ESC;
+            buf[pos + 1] = LUNA_FP_DROP_GOTO;
             pos = q2;
             continue;
         }
@@ -17408,6 +17479,11 @@ typedef enum {
 #define FUNC_RET_YIELD_STAR    2
 #define FUNC_RET_INITIAL_YIELD 3
 
+/* Luna JIT entry points (implemented after the opcode tables below). */
+static struct LunaJit *luna_jit_compile(JSContext *ctx, JSFunctionBytecode *b);
+static int luna_jit_run(JSFunctionBytecode *b, LunaJitArgs *a);
+static void luna_jit_free(JSRuntime *rt, struct LunaJit *j);
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -17629,6 +17705,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      * pass on exit restores the encoded form. Larger functions keep the
      * encoded stream and decode windows at fetch time instead.
      */
+    /*
+     * Native tier fast path. A cached image is entered directly for a fresh
+     * call, without touching the bytecode dispatcher. The stream is still
+     * decoded first: reentrant calls from an interrupt handler must see
+     * ordinary canonical bytecode while this frame is running natively.
+     */
+    if (unlikely (b->luna_jit != NULL) && b->luna_op_map != NULL &&
+        pc == b->byte_code_buf && sp == stack_buf &&
+        var_refs == NULL && !(flags & JS_CALL_FLAG_GENERATOR)) {
+        luna_own_full = 1;
+        luna_saved_map = b->luna_op_map;
+        luna_decode_full (b);
+        b->luna_op_map = NULL;
+        goto luna_jit_enter;
+    }
+
     if (unlikely (b->luna_op_map != NULL))
     {
         if (unlikely (!b->luna_inited))
@@ -17738,6 +17830,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              */
             luna_decode_full (b);
             b->luna_targets_built = 1;
+            /* compile once, from the canonical stream that is decoded here
+             * anyway; the buffer never holds canonical bytes at rest */
+            if (var_refs == NULL && !(flags & JS_CALL_FLAG_GENERATOR) &&
+                !b->luna_jit_attempted) {
+                b->luna_jit_attempted = 1;
+                b->luna_jit = luna_jit_compile (ctx, b);
+            }
+            if (b->luna_jit != NULL && var_refs == NULL &&
+                !(flags & JS_CALL_FLAG_GENERATOR)) {
+                luna_own_full = 1;
+                luna_saved_map = b->luna_op_map;
+                b->luna_op_map = NULL;
+                goto luna_jit_enter;
+            }
 #if DIRECT_DISPATCH
             luna_fuse (b);
 #endif
@@ -17747,6 +17853,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
 
+    goto luna_interpret;
+
+ luna_jit_enter:
+    {
+        LunaJitArgs a;
+        int st;
+
+        a.ctx = ctx;
+        a.vars = var_buf;
+        a.args = arg_buf;
+        a.stack = stack_buf;
+        a.ret = JS_UNDEFINED;
+        a.bail_pc = 0;
+        a.bail_depth = 0;
+        a.poll_fn = NULL;
+        a.mod_fn = NULL;
+        st = luna_jit_run (b, &a);
+        if (likely (st == 0)) {
+            ret_val = a.ret;
+            sp = stack_buf;
+            goto done;
+        }
+        if (st == 1) {
+            /* the stream is canonical here (the entry paths decode it), so
+             * the interpreter can resume without fusing anything */
+            sp = stack_buf + a.bail_depth;
+            pc = b->byte_code_buf + a.bail_pc;
+            goto luna_interpret;
+        }
+        sp = stack_buf;
+        pc = b->byte_code_buf + a.bail_pc;
+        sf->cur_pc = pc;
+        goto exception;
+    }
+
+ luna_interpret:
     for(;;) {
         int call_argc;
         JSValue *call_argv;
@@ -21054,6 +21196,109 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                     break;
+                case LUNA_FP_LARGLT:
+                    {
+                        int x, arg, cmpid;
+                        int8_t rel;
+                        int res;
+                        JSValue op1, op2;
+
+                        x = (int)(pc[1] | ((uint32_t)pc[2] << 8));
+                        cmpid = pc[3];
+                        arg = pc[4];
+                        rel = (int8_t)pc[5];
+                        pc += 6;
+                        if (unlikely(JS_IsUninitialized(var_buf[x]))) {
+                            JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
+                            goto exception;
+                        }
+                        *sp++ = JS_DupValue(ctx, var_buf[x]);
+                        *sp++ = JS_DupValue(ctx, arg_buf[arg]);
+                        op1 = sp[-2];
+                        op2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                            sp[-2] = JS_NewBool(ctx,
+                                cmpid == 0
+                                    ? JS_VALUE_GET_INT(op1) < JS_VALUE_GET_INT(op2)
+                                    : JS_VALUE_GET_INT(op1) > JS_VALUE_GET_INT(op2));
+                            sp--;
+                        } else {
+                            if (js_relational_slow(ctx, sp,
+                                                   cmpid == 0 ? OP_lt : OP_gt))
+                                goto exception;
+                            sp--;
+                        }
+                        op1 = sp[-1];
+                        if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                            res = JS_VALUE_GET_INT(op1);
+                        } else {
+                            res = JS_ToBoolFree(ctx, op1);
+                        }
+                        sp--;
+                        if (!res)
+                            pc += rel - 1;
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                    }
+                    break;
+                case LUNA_FP_LGT16_IF:
+                    {
+                        int x, c, cmpid;
+                        int8_t rel;
+                        int res;
+                        JSValue op1, op2;
+
+                        x = (int)(pc[1] | ((uint32_t)pc[2] << 8));
+                        c = (int16_t)(pc[3] | ((uint32_t)pc[4] << 8));
+                        cmpid = pc[5];
+                        rel = (int8_t)pc[7];
+                        pc += 8;
+                        if (unlikely(JS_IsUninitialized(var_buf[x]))) {
+                            JS_ThrowReferenceErrorUninitialized2(ctx, b, x, FALSE);
+                            goto exception;
+                        }
+                        *sp++ = JS_DupValue(ctx, var_buf[x]);
+                        *sp++ = JS_NewInt32(ctx, c);
+                        op1 = sp[-2];
+                        op2 = sp[-1];
+                        if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                            sp[-2] = JS_NewBool(ctx,
+                                cmpid == 0
+                                    ? JS_VALUE_GET_INT(op1) < JS_VALUE_GET_INT(op2)
+                                    : JS_VALUE_GET_INT(op1) > JS_VALUE_GET_INT(op2));
+                            sp--;
+                        } else {
+                            if (js_relational_slow(ctx, sp,
+                                                   cmpid == 0 ? OP_lt : OP_gt))
+                                goto exception;
+                            sp--;
+                        }
+                        op1 = sp[-1];
+                        if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
+                            res = JS_VALUE_GET_INT(op1);
+                        } else {
+                            res = JS_ToBoolFree(ctx, op1);
+                        }
+                        sp--;
+                        if (!res)
+                            pc += rel - 1;
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                    }
+                    break;
+                case LUNA_FP_DROP_GOTO:
+                    {
+                        int8_t rel;
+
+                        rel = (int8_t)pc[1];
+                        pc += 2;
+                        JS_FreeValue(ctx, sp[-1]);
+                        sp--;
+                        pc += rel - 1;
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                    }
+                    break;
                 case LUNA_FP_LGT_IF:
                     {
                         int x, c, cmpid;
@@ -22719,6 +22964,1934 @@ const uint8_t *luna_opcode_fmts(void)
 {
     luna_build_opcode_tables();
     return luna_op_fmt_tab;
+}
+
+/* ------------------------------------------------------------------ *
+ * Luna JIT (native tier, aarch64)
+ *
+ * Eligible sealed functions are compiled lazily to native code on first call.
+ * The generated code runs directly on the interpreter's JSValue slots: locals
+ * and arguments stay in place, and operand-stack values live in machine
+ * registers between bytecodes. Numbers are represented as float64 in d
+ * registers: integral slots are converted on load and every arithmetic store
+ * writes a FLOAT64 slot, so arithmetic overflow (which would force the
+ * integer tier back into the interpreter) never occurs and a numeric loop
+ * such as fib(300) stays native from the first iteration to the last.
+ * Booleans use the general-purpose registers.
+ *
+ * Functions that need semantics without a native form (heap values, strings,
+ * `%`, bitwise ops, calls, closures, generators) are rejected at compile
+ * time, so always-deopting code keeps the fused interpreter and its inline
+ * caches instead of paying the native entry cost. A runtime deopt (a
+ * non-numeric value in a slot or operand) branches to an out-of-line stub
+ * that spills the operand stack and resumes the interpreter at the exact
+ * bytecode pc; the stream is canonical at that point and is re-encoded on
+ * exit.
+ *
+ * The bytecode stream is never canonical at rest: the image is compiled from
+ * the transient whole-function decode, and only machine code is cached.
+ * ------------------------------------------------------------------ */
+
+#define LUNA_JIT_STACK_MAX   64
+#define LUNA_JIT_REG_COUNT   15
+#define LUNA_JIT_POLL_TICKS  4096
+
+#define JIT_AL 14
+#define JIT_EQ 0
+#define JIT_NE 1
+#define JIT_LT 11
+#define JIT_GE 10
+#define JIT_GT 12
+#define JIT_LE 13
+#define JIT_LS 9
+#define JIT_VS 6
+#define JIT_VC 7
+#define JIT_MI 4
+#define JIT_PL 5
+
+#define LUNA_JIT_GUARD_N 4
+
+typedef struct LunaJit {
+    void *code;
+    size_t map_len;
+    int (*fn)(LunaJitArgs *);
+    /* Sampled words of the RX image.  Entry verifies the prologue and one
+     * rotating sample, so tampering is caught in O(1) without a verification
+     * pass; a mismatch drops the image and the interpreter takes over. */
+    uint32_t guard_idx[LUNA_JIT_GUARD_N];
+    uint32_t guard_val[LUNA_JIT_GUARD_N];
+    uint8_t guard_cursor;
+} LunaJit;
+
+typedef struct LunaJCode {
+    JSContext *ctx;
+    uint32_t *w;
+    int n, cap;
+    int oom;
+} LunaJCode;
+
+typedef struct LunaJVal {
+    uint8_t kind;   /* 0 = constant, 1 = register */
+    uint8_t tag;    /* JS tag (register values are int or bool) */
+    uint8_t reg;
+    JSValue cval;
+} LunaJVal;
+
+typedef struct LunaJFix {
+    uint32_t at;
+    uint32_t pc;
+    uint8_t cond;
+} LunaJFix;
+
+typedef struct LunaJColdFix {
+    uint32_t at;
+    uint32_t cold;
+} LunaJColdFix;
+
+typedef struct LunaJCtx {
+    JSContext *ctx;
+    JSFunctionBytecode *b;
+    const uint8_t *bc;
+    uint32_t len;
+    LunaJCode hot, cold;
+    int32_t *depth;
+    uint32_t *label;
+    LunaJVal vst[LUNA_JIT_STACK_MAX];
+    int vst_n;
+    uint8_t reg_ref[32];
+    LunaJFix *fix;
+    int fix_n, fix_cap;
+    LunaJColdFix *cfix;
+    int cfix_n, cfix_cap;
+    int n_bails;
+    int fail;
+    uint32_t cold_base;
+} LunaJCtx;
+
+static const uint8_t luna_jit_pool[LUNA_JIT_REG_COUNT] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15
+};
+
+static int luna_jit_poll(LunaJitArgs *a)
+{
+    return js_poll_interrupts(a->ctx) < 0;
+}
+
+/* ---------------- aarch64 encoder ---------------- */
+
+static void jc_emit(LunaJCode *c, uint32_t insn)
+{
+    if (c->oom)
+        return;
+    if (c->n == c->cap) {
+        int cap = c->cap ? c->cap * 2 : 256;
+        uint32_t *w = js_realloc(c->ctx, c->w, cap * sizeof(*w));
+        if (!w) {
+            c->oom = 1;
+            return;
+        }
+        c->w = w;
+        c->cap = cap;
+    }
+    c->w[c->n++] = insn;
+}
+
+static void je_movz64(LunaJCode *c, int rd, uint16_t imm, int shift)
+{
+    jc_emit(c, 0xD2800000u | ((uint32_t)(shift / 16) << 21) |
+               ((uint32_t)imm << 5) | (uint32_t)rd);
+}
+
+static void je_movk64(LunaJCode *c, int rd, uint16_t imm, int shift)
+{
+    jc_emit(c, 0xF2800000u | ((uint32_t)(shift / 16) << 21) |
+               ((uint32_t)imm << 5) | (uint32_t)rd);
+}
+
+static void je_mov64(LunaJCode *c, int rd, uint64_t v)
+{
+    int started = 0, i;
+    for (i = 0; i < 4; i++) {
+        uint16_t part = (uint16_t)(v >> (i * 16));
+        if (part || started || i == 3) {
+            if (!started) {
+                je_movz64(c, rd, part, i * 16);
+                started = 1;
+            } else {
+                je_movk64(c, rd, part, i * 16);
+            }
+        }
+    }
+}
+
+static void je_movz32(LunaJCode *c, int rd, uint16_t imm, int shift)
+{
+    jc_emit(c, 0x52800000u | ((uint32_t)(shift / 16) << 21) |
+               ((uint32_t)imm << 5) | (uint32_t)rd);
+}
+
+static void je_movk32(LunaJCode *c, int rd, uint16_t imm, int shift)
+{
+    jc_emit(c, 0x72800000u | ((uint32_t)(shift / 16) << 21) |
+               ((uint32_t)imm << 5) | (uint32_t)rd);
+}
+
+static void je_mov32(LunaJCode *c, int rd, uint32_t v)
+{
+    je_movz32(c, rd, (uint16_t)(v & 0xffff), 0);
+    if (v >> 16)
+        je_movk32(c, rd, (uint16_t)(v >> 16), 16);
+}
+
+static void je_mov_rr(LunaJCode *c, int rd, int rm)
+{
+    jc_emit(c, 0xAA0003E0u | ((uint32_t)rm << 16) | (uint32_t)rd);
+}
+
+static void je_ldr_x(LunaJCode *c, int rt, int rn, uint32_t off)
+{
+    jc_emit(c, 0xF9400000u | ((off / 8) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+
+static void je_str_x(LunaJCode *c, int rt, int rn, uint32_t off)
+{
+    jc_emit(c, 0xF9000000u | ((off / 8) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+
+static void je_ldr_w(LunaJCode *c, int rt, int rn, uint32_t off)
+{
+    jc_emit(c, 0xB9400000u | ((off / 4) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+
+static void je_str_w(LunaJCode *c, int rt, int rn, uint32_t off)
+{
+    jc_emit(c, 0xB9000000u | ((off / 4) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+
+static void __attribute((unused)) je_add_x_imm(LunaJCode *c, int rd, int rn, uint32_t imm)
+{
+    jc_emit(c, 0x91000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_adds_w_imm(LunaJCode *c, int rd, int rn, uint32_t imm)
+{
+    jc_emit(c, 0x31000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_subs_w_imm(LunaJCode *c, int rd, int rn, uint32_t imm)
+{
+    jc_emit(c, 0x71000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_subs_x_imm(LunaJCode *c, int rd, int rn, uint32_t imm)
+{
+    jc_emit(c, 0xF1000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_adds_w_reg(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x2B000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_subs_w_reg(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x6B000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_negs_w(LunaJCode *c, int rd, int rm)
+{
+    jc_emit(c, 0x6B0003E0u | ((uint32_t)rm << 16) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_mvn_w(LunaJCode *c, int rd, int rm)
+{
+    jc_emit(c, 0x2A2003E0u | ((uint32_t)rm << 16) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_and_w(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x0A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_orr_w(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x2A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_eor_w(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x4A000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_lsl_w(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x1AC02000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_asr_w(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x1AC02800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_sxtw(LunaJCode *c, int rd, int rn)
+{
+    jc_emit(c, 0x93407C00u | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_mul_x(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x9B007C00u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_sdiv_w(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x1AC00C00u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_msub_w(LunaJCode *c, int rd, int rn, int rm, int ra)
+{
+    jc_emit(c, 0x1B008000u | ((uint32_t)rm << 16) | ((uint32_t)ra << 10) |
+               ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_cmp_w(LunaJCode *c, int rn, int rm)
+{
+    jc_emit(c, 0x6B00001Fu | ((uint32_t)rm << 16) | ((uint32_t)rn << 5));
+}
+
+static void je_cmp_wi(LunaJCode *c, int rn, uint32_t imm)
+{
+    jc_emit(c, 0x7100001Fu | (imm << 10) | ((uint32_t)rn << 5));
+}
+
+static void __attribute((unused)) je_cmp_x_sxtw(LunaJCode *c, int rn, int rm)
+{
+    jc_emit(c, 0xEB20C01Fu | ((uint32_t)rm << 16) | ((uint32_t)rn << 5));
+}
+
+static void je_cset_w(LunaJCode *c, int rd, int cond)
+{
+    jc_emit(c, 0x1A9F07E0u | ((uint32_t)(cond ^ 1) << 12) | (uint32_t)rd);
+}
+
+static void je_fadd(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x1E602800u | ((uint32_t)rm << 16) |
+               ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_fsub(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x1E603800u | ((uint32_t)rm << 16) |
+               ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_fmul(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x1E600800u | ((uint32_t)rm << 16) |
+               ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_fdiv(LunaJCode *c, int rd, int rn, int rm)
+{
+    jc_emit(c, 0x1E601800u | ((uint32_t)rm << 16) |
+               ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_fneg(LunaJCode *c, int rd, int rn)
+{
+    jc_emit(c, 0x1E614000u | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_fcmp(LunaJCode *c, int rn, int rm)
+{
+    jc_emit(c, 0x1E602000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5));
+}
+
+static void je_fcmp_zero(LunaJCode *c, int rn)
+{
+    jc_emit(c, 0x1E602008u | ((uint32_t)rn << 5));
+}
+
+static void je_scvtf_d_w(LunaJCode *c, int rd, int rn)
+{
+    jc_emit(c, 0x1E620000u | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void __attribute((unused)) je_csel_x(LunaJCode *c, int rd, int rn, int rm, int cond)
+{
+    jc_emit(c, 0x9A800000u | ((uint32_t)rm << 16) |
+               ((uint32_t)(cond) << 12) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_ldr_d(LunaJCode *c, int rt, int rn, uint32_t off)
+{
+    jc_emit(c, 0xFD400000u | ((off / 8) << 10) |
+               ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+
+static void je_str_d(LunaJCode *c, int rt, int rn, uint32_t off)
+{
+    jc_emit(c, 0xFD000000u | ((off / 8) << 10) |
+               ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+
+static void je_fmov_d_x(LunaJCode *c, int rd, int rn)
+{
+    jc_emit(c, 0x9E670000u | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_fmov_d_d(LunaJCode *c, int rd, int rm)
+{
+    jc_emit(c, 0x1E604000u | ((uint32_t)rm << 5) | (uint32_t)rd);
+}
+
+static void je_fmov_x_d(LunaJCode *c, int rd, int rn)
+{
+    jc_emit(c, 0x9E660000u | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+
+static void je_b(LunaJCode *c, int off4)
+{
+    jc_emit(c, 0x14000000u | ((uint32_t)off4 & 0x3FFFFFF));
+}
+
+static void je_bcond(LunaJCode *c, int cond, int off4)
+{
+    jc_emit(c, 0x54000000u | (((uint32_t)off4 & 0x7FFFF) << 5) | (uint32_t)cond);
+}
+
+static void je_cbz(LunaJCode *c, int rt, int off4)
+{
+    jc_emit(c, 0x34000000u | (((uint32_t)off4 & 0x7FFFF) << 5) | (uint32_t)rt);
+}
+
+static void __attribute((unused)) je_cbnz(LunaJCode *c, int rt, int off4)
+{
+    jc_emit(c, 0x35000000u | (((uint32_t)off4 & 0x7FFFF) << 5) | (uint32_t)rt);
+}
+
+static void je_blr(LunaJCode *c, int rn)
+{
+    jc_emit(c, 0xD63F0000u | ((uint32_t)rn << 5));
+}
+
+static void je_ret(LunaJCode *c)
+{
+    jc_emit(c, 0xD65F03C0u);
+}
+
+static void luna_jit_epilogue(LunaJCode *c)
+{
+    jc_emit(c, 0xA94153F3u); /* ldp x19, x20, [sp, #16] */
+    jc_emit(c, 0xA9425BF5u); /* ldp x21, x22, [sp, #32] */
+    jc_emit(c, 0xA94363F7u); /* ldp x23, x24, [sp, #48] */
+    jc_emit(c, 0xA8C67BFDu); /* ldp x29, x30, [sp], #96 */
+    je_ret(c);
+}
+
+/* ---------------- compile state helpers ---------------- */
+
+static void jit_mark_fail(LunaJCtx *c)
+{
+    c->fail = 1;
+}
+
+static int jit_reg_alloc(LunaJCtx *c)
+{
+    int i;
+    for (i = 0; i < LUNA_JIT_REG_COUNT; i++) {
+        int r = luna_jit_pool[i];
+        if (c->reg_ref[r] == 0) {
+            c->reg_ref[r] = 1;
+            return r;
+        }
+    }
+    jit_mark_fail(c);
+    return 0;
+}
+
+static void jit_reg_release(LunaJCtx *c, int r)
+{
+    if (r >= 0 && r < 32 && c->reg_ref[r] > 0)
+        c->reg_ref[r]--;
+}
+
+static void jit_push_reg(LunaJCtx *c, int reg, int tag)
+{
+    LunaJVal v;
+    if (c->vst_n >= LUNA_JIT_STACK_MAX) {
+        jit_mark_fail(c);
+        return;
+    }
+    v.kind = 1;
+    v.tag = (uint8_t)tag;
+    v.reg = (uint8_t)reg;
+    v.cval = JS_UNDEFINED;
+    c->vst[c->vst_n++] = v;
+}
+
+static void jit_push_const(LunaJCtx *c, JSValue val)
+{
+    LunaJVal v;
+    if (c->vst_n >= LUNA_JIT_STACK_MAX) {
+        jit_mark_fail(c);
+        return;
+    }
+    v.kind = 0;
+    v.tag = (uint8_t)JS_VALUE_GET_TAG(val);
+    v.reg = 0;
+    v.cval = val;
+    c->vst[c->vst_n++] = v;
+}
+
+static LunaJVal jit_pop(LunaJCtx *c)
+{
+    LunaJVal v;
+    if (c->vst_n <= 0) {
+        jit_mark_fail(c);
+        v.kind = 0;
+        v.tag = 0;
+        v.reg = 0;
+        v.cval = JS_UNDEFINED;
+        return v;
+    }
+    v = c->vst[--c->vst_n];
+    return v;
+}
+
+static void jit_release(LunaJCtx *c, LunaJVal v)
+{
+    if (v.kind == 1)
+        jit_reg_release(c, v.reg);
+}
+
+static void jit_dup_top(LunaJCtx *c)
+{
+    LunaJVal v;
+    if (c->vst_n <= 0) {
+        jit_mark_fail(c);
+        return;
+    }
+    v = c->vst[c->vst_n - 1];
+    if (v.kind == 1)
+        c->reg_ref[v.reg]++;
+    if (c->vst_n >= LUNA_JIT_STACK_MAX) {
+        jit_mark_fail(c);
+        return;
+    }
+    c->vst[c->vst_n++] = v;
+}
+
+static void jit_add_fix(LunaJCtx *c, uint32_t at, uint32_t pc, int cond)
+{
+    if (c->fix_n == c->fix_cap) {
+        int cap = c->fix_cap ? c->fix_cap * 2 : 32;
+        LunaJFix *f = js_realloc(c->ctx, c->fix, cap * sizeof(*f));
+        if (!f) {
+            jit_mark_fail(c);
+            return;
+        }
+        c->fix = f;
+        c->fix_cap = cap;
+    }
+    c->fix[c->fix_n].at = at;
+    c->fix[c->fix_n].pc = pc;
+    c->fix[c->fix_n].cond = (uint8_t)cond;
+    c->fix_n++;
+}
+
+static void jit_add_cfix(LunaJCtx *c, uint32_t at, uint32_t cold)
+{
+    if (c->cfix_n == c->cfix_cap) {
+        int cap = c->cfix_cap ? c->cfix_cap * 2 : 32;
+        LunaJColdFix *f = js_realloc(c->ctx, c->cfix, cap * sizeof(*f));
+        if (!f) {
+            jit_mark_fail(c);
+            return;
+        }
+        c->cfix = f;
+        c->cfix_cap = cap;
+    }
+    c->cfix[c->cfix_n].at = at;
+    c->cfix[c->cfix_n].cold = cold;
+    c->cfix_n++;
+}
+
+/* Spill one virtual value to slot `slot` of the interpreter operand stack. */
+static void jit_spill_val(LunaJCtx *c, int slot, const LunaJVal *v)
+{
+    uint32_t off = (uint32_t)slot * 16;
+    uint64_t payload;
+
+    if (v->kind == 1) {
+        if (v->tag == JS_TAG_INT)
+            je_str_d(&c->cold, v->reg, 22, off);
+        else
+            je_str_x(&c->cold, v->reg, 22, off);
+        je_mov64(&c->cold, 8,
+                 v->tag == JS_TAG_INT ? JS_TAG_FLOAT64 : v->tag);
+        je_str_x(&c->cold, 8, 22, off + 8);
+        return;
+    }
+    memcpy(&payload, &v->cval.u, sizeof(payload));
+    je_mov64(&c->cold, 8, payload);
+    je_str_x(&c->cold, 8, 22, off);
+    je_mov64(&c->cold, 8, (uint64_t)v->cval.tag);
+    je_str_x(&c->cold, 8, 22, off + 8);
+}
+
+/*
+ * Spill/reload the register-resident virtual stack around an out-of-line
+ * helper call.  The helper follows AAPCS64 and may clobber every caller-saved
+ * register, so the values are written to their interpreter stack slots first
+ * and then rebuilt into the same registers.  Only registers need saving:
+ * constants have no runtime state.  The tags are not written here because the
+ * slots are scratch until a bailout stub spills a full tagged snapshot.
+ */
+static void jit_spill_stack(LunaJCtx *c)
+{
+    int i;
+    for (i = 0; i < c->vst_n; i++) {
+        const LunaJVal *v = &c->vst[i];
+        uint32_t off = (uint32_t)i * 16;
+        if (v->kind != 1)
+            continue;
+        if (v->tag == JS_TAG_INT)
+            je_str_d(&c->hot, v->reg, 22, off);
+        else
+            je_str_x(&c->hot, v->reg, 22, off);
+    }
+}
+
+static void jit_reload_stack(LunaJCtx *c)
+{
+    int i;
+    for (i = 0; i < c->vst_n; i++) {
+        const LunaJVal *v = &c->vst[i];
+        uint32_t off = (uint32_t)i * 16;
+        if (v->kind != 1)
+            continue;
+        if (v->tag == JS_TAG_INT)
+            je_ldr_d(&c->hot, v->reg, 22, off);
+        else
+            je_ldr_w(&c->hot, v->reg, 22, off);
+    }
+}
+
+/*
+ * Emit a bailout check in the hot stream and its spill stub in the cold
+ * stream. `cond` is the condition under which the bail is taken (JIT_AL for
+ * an unconditional bail). The snapshot is the operand stack as it is at the
+ * bytecode pc the interpreter must resume from.
+ */
+static void jit_bail_cond(LunaJCtx *c, int cond, uint32_t pc, int depth,
+                          const LunaJVal *snap, int nsnap, int status)
+{
+    int at, cold_idx, i;
+
+    if (c->fail)
+        return;
+    if (cond == JIT_AL) {
+        at = c->hot.n;
+        je_b(&c->hot, 0);
+    } else {
+        je_bcond(&c->hot, cond ^ 1, 2);
+        at = c->hot.n;
+        je_b(&c->hot, 0);
+    }
+    cold_idx = c->cold.n;
+    for (i = 0; i < nsnap; i++)
+        jit_spill_val(c, i, &snap[i]);
+    je_mov32(&c->cold, 1, pc);
+    je_str_w(&c->cold, 1, 19, 48);
+    je_mov32(&c->cold, 1, (uint32_t)depth);
+    je_str_w(&c->cold, 1, 19, 52);
+    je_mov32(&c->cold, 0, (uint32_t)status);
+    luna_jit_epilogue(&c->cold);
+    jit_add_cfix(c, (uint32_t)at, (uint32_t)cold_idx);
+    c->n_bails++;
+}
+
+static void jit_branch(LunaJCtx *c, int cond, uint32_t target)
+{
+    int at, delta;
+
+    if (c->fail)
+        return;
+    if (target >= c->len) {
+        jit_mark_fail(c);
+        return;
+    }
+    if (c->label[target] != UINT32_MAX) {
+        delta = (int)(c->label[target] / 4) - c->hot.n;
+        if (cond == JIT_AL)
+            je_b(&c->hot, delta);
+        else
+            je_bcond(&c->hot, cond, delta);
+        return;
+    }
+    at = c->hot.n;
+    if (cond == JIT_AL)
+        je_b(&c->hot, 0);
+    else
+        je_bcond(&c->hot, cond, 0);
+    jit_add_fix(c, (uint32_t)at, target, cond);
+}
+
+static void jit_emit_poll(LunaJCtx *c, uint32_t loop_pc)
+{
+    int at;
+
+    if (c->fail)
+        return;
+    je_subs_x_imm(&c->hot, 24, 24, 1);
+    je_bcond(&c->hot, JIT_NE, 7);           /* skip the whole sequence */
+    je_movz64(&c->hot, 24, LUNA_JIT_POLL_TICKS, 0);
+    je_mov_rr(&c->hot, 0, 19);              /* luna_jit_poll(args) */
+    je_ldr_x(&c->hot, 9, 19, 56);           /* poll callback */
+    je_blr(&c->hot, 9);
+    je_cbz(&c->hot, 0, 2);                  /* no exception: skip the bail */
+    at = c->hot.n;
+    je_b(&c->hot, 0);
+    /* cold: exception while polling */
+    {
+        int cold_idx = c->cold.n;
+        je_mov32(&c->cold, 1, loop_pc);
+        je_str_w(&c->cold, 1, 19, 48);
+        je_mov32(&c->cold, 1, 0);
+        je_str_w(&c->cold, 1, 19, 52);
+        je_mov32(&c->cold, 0, 2);
+        luna_jit_epilogue(&c->cold);
+        jit_add_cfix(c, (uint32_t)at, (uint32_t)cold_idx);
+    }
+}
+
+static void jit_store_const(LunaJCode *c, int base, uint32_t off, JSValue v)
+{
+    uint64_t payload;
+    memcpy(&payload, &v.u, sizeof(payload));
+    je_mov64(c, 8, payload);
+    je_str_x(c, 8, base, off);
+    je_mov64(c, 8, (uint64_t)v.tag);
+    je_str_x(c, 8, base, off + 8);
+}
+
+static void jit_store_val(LunaJCode *c, int base, uint32_t off, LunaJVal v)
+{
+    if (v.kind == 0) {
+        jit_store_const(c, base, off, v.cval);
+        return;
+    }
+    if (v.tag == JS_TAG_INT)
+        je_str_d(c, v.reg, base, off);
+    else
+        je_str_x(c, v.reg, base, off);
+    je_mov64(c, 8, v.tag == JS_TAG_INT ? JS_TAG_FLOAT64 : v.tag);
+    je_str_x(c, 8, base, off + 8);
+}
+
+/* ---------------- reachability / eligibility ---------------- */
+
+static int jit_const_pool_ok(JSContext *ctx, JSFunctionBytecode *b, int idx,
+                             JSValue *out)
+{
+    int tag;
+    (void)ctx;
+    if (idx < 0 || idx >= b->cpool_count)
+        return 0;
+    *out = b->cpool[idx];
+    tag = JS_VALUE_GET_TAG(*out);
+    if (tag < 0)
+        return 0; /* heap constants need refcount handling: stay in the interpreter */
+    if (tag == JS_TAG_UNINITIALIZED || tag == JS_TAG_CATCH_OFFSET ||
+        tag == JS_TAG_EXCEPTION)
+        return 0;
+    return 1;
+}
+
+static int jit_op_supported(LunaJCtx *c, uint32_t pc, int *out_size)
+{
+    int op = c->bc[pc];
+    int size = luna_op_size_tab[op];
+    JSValue cv;
+
+    if (size == 0)
+        return 0;
+    *out_size = size;
+
+#if SHORT_OPCODES
+    if (op >= OP_push_minus1 && op <= OP_push_7)
+        return 1;
+#endif
+    switch (op) {
+    case OP_push_i32:
+#if SHORT_OPCODES
+    case OP_push_i16:
+    case OP_push_i8:
+#endif
+    case OP_undefined:
+    case OP_null:
+    case OP_push_false:
+    case OP_push_true:
+    case OP_get_loc:
+    case OP_put_loc:
+    case OP_set_loc:
+    case OP_set_loc_uninitialized:
+    case OP_get_loc_check:
+    case OP_put_loc_check:
+    case OP_get_arg:
+    case OP_put_arg:
+    case OP_set_arg:
+    case OP_inc_loc:
+    case OP_dec_loc:
+    case OP_add_loc:
+    case OP_post_inc:
+    case OP_post_dec:
+    case OP_inc:
+    case OP_dec:
+    case OP_neg:
+    case OP_lnot:
+    case OP_add:
+    case OP_sub:
+    case OP_mul:
+    case OP_div:
+    case OP_mod:
+    /* OP_not and the bitwise ops need ToInt32 semantics; until they have
+     * native forms, functions using them are rejected so that always-deopting
+     * code keeps the fused interpreter instead. */
+    case OP_lt:
+    case OP_lte:
+    case OP_gt:
+    case OP_gte:
+    case OP_eq:
+    case OP_neq:
+    case OP_strict_eq:
+    case OP_strict_neq:
+    case OP_if_false:
+    case OP_if_true:
+#if SHORT_OPCODES
+    case OP_if_false8:
+    case OP_if_true8:
+#endif
+    case OP_goto:
+#if SHORT_OPCODES
+    case OP_goto16:
+    case OP_goto8:
+#endif
+    case OP_drop:
+    case OP_dup:
+    case OP_nop:
+    case OP_return:
+    case OP_return_undef:
+        return 1;
+#if SHORT_OPCODES
+    case OP_get_loc8:
+    case OP_put_loc8:
+    case OP_set_loc8:
+    case OP_get_loc0:
+    case OP_get_loc1:
+    case OP_get_loc2:
+    case OP_get_loc3:
+    case OP_put_loc0:
+    case OP_put_loc1:
+    case OP_put_loc2:
+    case OP_put_loc3:
+    case OP_set_loc0:
+    case OP_set_loc1:
+    case OP_set_loc2:
+    case OP_set_loc3:
+    case OP_get_arg0:
+    case OP_get_arg1:
+    case OP_get_arg2:
+    case OP_get_arg3:
+    case OP_put_arg0:
+    case OP_put_arg1:
+    case OP_put_arg2:
+    case OP_put_arg3:
+    case OP_set_arg0:
+    case OP_set_arg1:
+    case OP_set_arg2:
+    case OP_set_arg3:
+        return 1;
+#endif
+#if SHORT_OPCODES
+    case OP_push_const8:
+        return jit_const_pool_ok(c->ctx, c->b, c->bc[pc + 1], &cv);
+#endif
+    case OP_push_const:
+        return jit_const_pool_ok(c->ctx, c->b,
+                                 (int)get_u32(c->bc + pc + 1), &cv);
+    default:
+        return 0;
+    }
+}
+
+static int jit_rel_target(const uint8_t *bc, uint32_t pc, int size)
+{
+    int32_t rel;
+    if (size == 2)
+        rel = (int8_t)bc[pc + 1];
+    else if (size == 3)
+        rel = (int16_t)get_u16(bc + pc + 1);
+    else if (size == 5)
+        rel = (int32_t)get_u32(bc + pc + 1);
+    else
+        return -1;
+    return (int)(pc + 1 + (uint32_t)rel);
+}
+
+static int jit_analyze(LunaJCtx *c)
+{
+    JSContext *ctx = c->ctx;
+    uint32_t len = c->len;
+    uint32_t *wpc = NULL;
+    int32_t *wdep = NULL;
+    int wn = 0, i, ok = 0;
+
+    c->depth = js_malloc(ctx, (len + 1) * sizeof(int32_t));
+    c->label = js_malloc(ctx, (len + 1) * sizeof(uint32_t));
+    if (!c->depth || !c->label)
+        goto done;
+    for (i = 0; i < (int)len + 1; i++) {
+        c->depth[i] = -1;
+        c->label[i] = UINT32_MAX;
+    }
+    wpc = js_malloc(ctx, ((size_t)len * 2 + 16) * sizeof(uint32_t));
+    wdep = js_malloc(ctx, ((size_t)len * 2 + 16) * sizeof(int32_t));
+    if (!wpc || !wdep)
+        goto done;
+    wpc[wn] = 0;
+    wdep[wn] = 0;
+    wn++;
+    while (wn > 0) {
+        uint32_t pc;
+        int depth, size = 0;
+
+        wn--;
+        pc = wpc[wn];
+        depth = wdep[wn];
+        if (pc >= len) {
+            goto done;
+        }
+        if (c->depth[pc] >= 0) {
+            if (c->depth[pc] != depth)
+                goto done;
+            continue;
+        }
+        c->depth[pc] = depth;
+        if (!jit_op_supported(c, pc, &size))
+            goto done;
+        {
+            int op = c->bc[pc];
+            int d2;
+
+            if (op == OP_if_false || op == OP_if_true ||
+                op == OP_if_false8 || op == OP_if_true8) {
+                int target;
+                if (depth != 1)
+                    goto done;
+                target = jit_rel_target(c->bc, pc, size);
+                if (target < 0 || (uint32_t)target >= len)
+                    goto done;
+                /* every branch target must have an empty operand stack */
+                if (wn + 2 >= (int)((size_t)len * 2 + 16))
+                    goto done;
+                wpc[wn] = (uint32_t)target;
+                wdep[wn] = 0;
+                wn++;
+                wpc[wn] = pc + (uint32_t)size;
+                wdep[wn] = 0;
+                wn++;
+                continue;
+            }
+            if (op == OP_goto || op == OP_goto8 || op == OP_goto16) {
+                int target;
+                if (depth != 0)
+                    goto done;
+                target = jit_rel_target(c->bc, pc, size);
+                if (target < 0 || (uint32_t)target >= len)
+                    goto done;
+                if (wn + 1 >= (int)((size_t)len * 2 + 16))
+                    goto done;
+                wpc[wn] = (uint32_t)target;
+                wdep[wn] = 0;
+                wn++;
+                continue;
+            }
+            if (op == OP_return) {
+                if (depth != 1)
+                    goto done;
+                continue;
+            }
+            if (op == OP_return_undef) {
+                if (depth != 0)
+                    goto done;
+                continue;
+            }
+            {
+                const JSOpCode *oi = &short_opcode_info(op);
+                if (depth < oi->n_pop)
+                    goto done;
+                d2 = depth - oi->n_pop + oi->n_push;
+                if (d2 < 0 || d2 > LUNA_JIT_STACK_MAX ||
+                    d2 > (int)c->b->stack_size)
+                    goto done;
+                if (wn + 1 >= (int)((size_t)len * 2 + 16))
+                    goto done;
+                wpc[wn] = pc + (uint32_t)size;
+                wdep[wn] = d2;
+                wn++;
+            }
+        }
+    }
+    ok = 1;
+done:
+    js_free(ctx, wpc);
+    js_free(ctx, wdep);
+    return ok;
+}
+
+/* ---------------- code generation ---------------- */
+
+static uint64_t jit_dbits(double d)
+{
+    uint64_t b;
+    memcpy(&b, &d, sizeof(b));
+    return b;
+}
+
+/* Numeric value of a constant, which may be stored as an int or a double. */
+static double jit_val_d(LunaJVal v)
+{
+    if (v.tag == JS_TAG_INT)
+        return (double)v.cval.u.int32;
+    return v.cval.u.float64;
+}
+
+/* Materialise a numeric constant in `scratch`, or return the value register. */
+static int jit_num_reg(LunaJCtx *c, LunaJVal v, int scratch)
+{
+    if (v.kind == 1)
+        return v.reg;
+    je_mov64(&c->hot, 8, jit_dbits(jit_val_d(v)));
+    je_fmov_d_x(&c->hot, scratch, 8);
+    return scratch;
+}
+
+/* Store a double register into a JSValue slot. */
+static void jit_store_num(LunaJCode *c, int base, uint32_t off, int reg)
+{
+    je_str_d(c, reg, base, off);
+    je_mov64(c, 8, JS_TAG_FLOAT64);
+    je_str_x(c, 8, base, off + 8);
+}
+
+/*
+ * Load a slot as a numeric value in a register. Integral slots are converted
+ * to double, float slots are copied bit for bit. Anything else (bool, heap,
+ * uninitialised) deopts to the interpreter.
+ */
+static int jit_load_slot_reg(LunaJCtx *c, uint32_t pc, int base, int idx,
+                             const LunaJVal *snap, int snap_n)
+{
+    int r = jit_reg_alloc(c);
+    uint32_t off = (uint32_t)idx * 16;
+
+    je_ldr_w(&c->hot, 23, base, off + 8);
+    je_cmp_wi(&c->hot, 23, JS_TAG_FLOAT64);
+    je_bcond(&c->hot, JIT_EQ, 7);       /* -> float load below */
+    je_cmp_wi(&c->hot, 23, JS_TAG_INT);
+    jit_bail_cond(c, JIT_NE, pc, snap_n, snap, snap_n, 1);
+    je_ldr_w(&c->hot, r, base, off);
+    je_scvtf_d_w(&c->hot, r, r);
+    je_b(&c->hot, 2);                   /* -> done */
+    je_ldr_d(&c->hot, r, base, off);
+    return r;
+}
+
+static void jit_emit_load_slot(LunaJCtx *c, uint32_t pc, int base, int idx,
+                               const LunaJVal *snap, int snap_n)
+{
+    int r = jit_load_slot_reg(c, pc, base, idx, snap, snap_n);
+    jit_push_reg(c, r, 0);
+}
+
+static void jit_emit_check_old(LunaJCtx *c, uint32_t pc, int base, int idx,
+                               int check_uninit, const LunaJVal *snap, int snap_n)
+{
+    je_ldr_w(&c->hot, 8, base, (uint32_t)idx * 16 + 8);
+    if (check_uninit) {
+        je_cmp_wi(&c->hot, 8, 4);
+        jit_bail_cond(c, JIT_EQ, pc, snap_n, snap, snap_n, 1);
+    }
+    je_cmp_wi(&c->hot, 8, 0);
+    jit_bail_cond(c, JIT_LT, pc, snap_n, snap, snap_n, 1);
+}
+
+/*
+ * Out-of-line JS `%` helper for the native tier.  The interpreter's slow path
+ * also uses fmod(), so this matches its behaviour for negative operands, -0
+ * and NaN exactly.  It is a real C function to get the AAPCS64 float ABI.
+ */
+static double luna_jit_fmod(double a, double b)
+{
+    return fmod(a, b);
+}
+
+static void jit_emit_op(LunaJCtx *c, uint32_t pc, int size)
+{
+    int op = c->bc[pc];
+    LunaJVal snap[LUNA_JIT_STACK_MAX];
+    int snap_n = c->vst_n;
+
+    memcpy(snap, c->vst, (size_t)snap_n * sizeof(snap[0]));
+    (void)size;
+
+#define JIT_BAIL(cond) jit_bail_cond(c, (cond), pc, snap_n, snap, snap_n, 1)
+#define JIT_PUSH_NUM_CONST(v) \
+    jit_push_const(c, JS_NewFloat64(c->ctx, (double)(v)))
+#define JIT_NUM(v)                                                       \
+    (((v).kind == 1 && (v).tag == JS_TAG_INT) ||                         \
+     ((v).kind == 0 && ((v).tag == JS_TAG_INT ||                         \
+                        (v).tag == JS_TAG_FLOAT64)))
+#define JIT_BAIL_IF_NOT_NUM(v)                                           \
+    do {                                                                 \
+        if (!JIT_NUM(v)) {                                               \
+            JIT_BAIL(JIT_AL);                                            \
+            if ((v).kind == 1)                                           \
+                jit_reg_release(c, (v).reg);                             \
+            (v).kind = 0;                                                \
+            (v).cval = JS_NewFloat64(c->ctx, 0.0);                       \
+            (v).tag = (uint8_t)JS_VALUE_GET_TAG((v).cval);               \
+        }                                                                \
+    } while (0)
+
+#if SHORT_OPCODES
+    if (op >= OP_push_minus1 && op <= OP_push_7) {
+        JIT_PUSH_NUM_CONST(op - OP_push_0);
+        return;
+    }
+#endif
+
+    switch (op) {
+    case OP_push_i32:
+        JIT_PUSH_NUM_CONST((int32_t)get_u32(c->bc + pc + 1));
+        break;
+#if SHORT_OPCODES
+    case OP_push_i16:
+        JIT_PUSH_NUM_CONST((int16_t)get_u16(c->bc + pc + 1));
+        break;
+    case OP_push_i8:
+        JIT_PUSH_NUM_CONST((int8_t)c->bc[pc + 1]);
+        break;
+#endif
+    case OP_undefined:
+        jit_push_const(c, JS_UNDEFINED);
+        break;
+    case OP_null:
+        jit_push_const(c, JS_NULL);
+        break;
+    case OP_push_false:
+        jit_push_const(c, JS_FALSE);
+        break;
+    case OP_push_true:
+        jit_push_const(c, JS_TRUE);
+        break;
+#if SHORT_OPCODES
+    case OP_push_const8:
+        jit_push_const(c, c->b->cpool[c->bc[pc + 1]]);
+        break;
+#endif
+    case OP_push_const:
+        jit_push_const(c, c->b->cpool[get_u32(c->bc + pc + 1)]);
+        break;
+
+    case OP_get_loc:
+    case OP_get_loc_check:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            jit_emit_load_slot(c, pc, 20, idx, snap, snap_n);
+        }
+        break;
+#if SHORT_OPCODES
+    case OP_get_loc8:
+        jit_emit_load_slot(c, pc, 20, c->bc[pc + 1], snap, snap_n);
+        break;
+    case OP_get_loc0:
+    case OP_get_loc1:
+    case OP_get_loc2:
+    case OP_get_loc3:
+        jit_emit_load_slot(c, pc, 20, op - OP_get_loc0, snap, snap_n);
+        break;
+#endif
+    case OP_get_arg:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            jit_emit_load_slot(c, pc, 21, idx, snap, snap_n);
+        }
+        break;
+#if SHORT_OPCODES
+    case OP_get_arg0:
+    case OP_get_arg1:
+    case OP_get_arg2:
+    case OP_get_arg3:
+        jit_emit_load_slot(c, pc, 21, op - OP_get_arg0, snap, snap_n);
+        break;
+#endif
+
+    case OP_put_loc:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 20, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 20, (uint32_t)idx * 16, v);
+            v = jit_pop(c);
+            jit_release(c, v);
+        }
+        break;
+#if SHORT_OPCODES
+    case OP_put_loc8:
+        {
+            int idx = c->bc[pc + 1];
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 20, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 20, (uint32_t)idx * 16, v);
+            v = jit_pop(c);
+            jit_release(c, v);
+        }
+        break;
+    case OP_put_loc0:
+    case OP_put_loc1:
+    case OP_put_loc2:
+    case OP_put_loc3:
+        {
+            int idx = op - OP_put_loc0;
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 20, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 20, (uint32_t)idx * 16, v);
+            v = jit_pop(c);
+            jit_release(c, v);
+        }
+        break;
+#endif
+    case OP_put_loc_check:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 20, idx, 1, snap, snap_n);
+            jit_store_val(&c->hot, 20, (uint32_t)idx * 16, v);
+            v = jit_pop(c);
+            jit_release(c, v);
+        }
+        break;
+    case OP_set_loc:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 20, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 20, (uint32_t)idx * 16, v);
+        }
+        break;
+#if SHORT_OPCODES
+    case OP_set_loc8:
+        {
+            int idx = c->bc[pc + 1];
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 20, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 20, (uint32_t)idx * 16, v);
+        }
+        break;
+    case OP_set_loc0:
+    case OP_set_loc1:
+    case OP_set_loc2:
+    case OP_set_loc3:
+        {
+            int idx = op - OP_set_loc0;
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 20, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 20, (uint32_t)idx * 16, v);
+        }
+        break;
+#endif
+    case OP_set_loc_uninitialized:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            jit_emit_check_old(c, pc, 20, idx, 0, snap, snap_n);
+            je_str_x(&c->hot, 31, 20, (uint32_t)idx * 16);
+            je_mov64(&c->hot, 8, JS_TAG_UNINITIALIZED);
+            je_str_x(&c->hot, 8, 20, (uint32_t)idx * 16 + 8);
+        }
+        break;
+
+    case OP_put_arg:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 21, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 21, (uint32_t)idx * 16, v);
+            v = jit_pop(c);
+            jit_release(c, v);
+        }
+        break;
+#if SHORT_OPCODES
+    case OP_put_arg0:
+    case OP_put_arg1:
+    case OP_put_arg2:
+    case OP_put_arg3:
+        {
+            int idx = op - OP_put_arg0;
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 21, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 21, (uint32_t)idx * 16, v);
+            v = jit_pop(c);
+            jit_release(c, v);
+        }
+        break;
+#endif
+    case OP_set_arg:
+        {
+            int idx = get_u16(c->bc + pc + 1);
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 21, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 21, (uint32_t)idx * 16, v);
+        }
+        break;
+#if SHORT_OPCODES
+    case OP_set_arg0:
+    case OP_set_arg1:
+    case OP_set_arg2:
+    case OP_set_arg3:
+        {
+            int idx = op - OP_set_arg0;
+            LunaJVal v = c->vst[c->vst_n - 1];
+            jit_emit_check_old(c, pc, 21, idx, 0, snap, snap_n);
+            jit_store_val(&c->hot, 21, (uint32_t)idx * 16, v);
+        }
+        break;
+#endif
+
+    case OP_inc_loc:
+    case OP_dec_loc:
+    case OP_add_loc:
+        {
+            int idx = c->bc[pc + 1];
+            uint32_t off = (uint32_t)idx * 16;
+            LunaJVal top;
+            int lr, rr;
+
+            if (op == OP_add_loc) {
+                top = jit_pop(c);
+                JIT_BAIL_IF_NOT_NUM(top);
+            }
+            lr = jit_load_slot_reg(c, pc, 20, idx, snap, snap_n);
+            rr = jit_reg_alloc(c);
+            if (op == OP_add_loc) {
+                int tr = jit_num_reg(c, top, 23);
+                je_fadd(&c->hot, rr, lr, tr);
+            } else {
+                je_mov64(&c->hot, 8, jit_dbits(1.0));
+                je_fmov_d_x(&c->hot, 23, 8);
+                if (op == OP_inc_loc)
+                    je_fadd(&c->hot, rr, lr, 23);
+                else
+                    je_fsub(&c->hot, rr, lr, 23);
+            }
+            jit_store_num(&c->hot, 20, off, rr);
+            jit_reg_release(c, rr);
+            jit_reg_release(c, lr);
+            if (op == OP_add_loc)
+                jit_release(c, top);
+        }
+        break;
+
+    case OP_post_inc:
+    case OP_post_dec:
+        {
+            LunaJVal a = c->vst[c->vst_n - 1];
+            int rr;
+            JIT_BAIL_IF_NOT_NUM(a);
+            if (a.kind == 0) {
+                double v = jit_val_d(a);
+                jit_pop(c); /* replace the old top */
+                JIT_PUSH_NUM_CONST(v);
+                JIT_PUSH_NUM_CONST((op == OP_post_inc) ? v + 1 : v - 1);
+                break;
+            }
+            rr = jit_reg_alloc(c);
+            je_mov64(&c->hot, 8, jit_dbits(1.0));
+                je_fmov_d_x(&c->hot, 23, 8);
+            if (op == OP_post_inc)
+                je_fadd(&c->hot, rr, a.reg, 23);
+            else
+                je_fsub(&c->hot, rr, a.reg, 23);
+            /* [old, new], both owned by the stack */
+            a = c->vst[c->vst_n - 1];
+            c->reg_ref[a.reg]++;
+            jit_push_reg(c, rr, 0);
+        }
+        break;
+
+    case OP_inc:
+    case OP_dec:
+        {
+            LunaJVal a = jit_pop(c);
+            int rr;
+            JIT_BAIL_IF_NOT_NUM(a);
+            if (a.kind == 0) {
+                double v = jit_val_d(a);
+                JIT_PUSH_NUM_CONST((op == OP_inc) ? v + 1 : v - 1);
+                break;
+            }
+            rr = jit_reg_alloc(c);
+            je_mov64(&c->hot, 8, jit_dbits(1.0));
+                je_fmov_d_x(&c->hot, 23, 8);
+            if (op == OP_inc)
+                je_fadd(&c->hot, rr, a.reg, 23);
+            else
+                je_fsub(&c->hot, rr, a.reg, 23);
+            jit_push_reg(c, rr, 0);
+            jit_release(c, a);
+        }
+        break;
+
+    case OP_neg:
+        {
+            LunaJVal a = jit_pop(c);
+            int rr;
+            JIT_BAIL_IF_NOT_NUM(a);
+            if (a.kind == 0) {
+                JIT_PUSH_NUM_CONST(-jit_val_d(a));
+                break;
+            }
+            rr = jit_reg_alloc(c);
+            je_fneg(&c->hot, rr, a.reg);
+            jit_push_reg(c, rr, 0);
+            jit_release(c, a);
+        }
+        break;
+
+    case OP_lnot:
+        {
+            LunaJVal a = jit_pop(c);
+            int rr;
+            if (a.kind == 0) {
+                int res;
+                if (a.tag == JS_TAG_FLOAT64) {
+                    double d = a.cval.u.float64;
+                    res = !(d != 0 && !isnan(d));
+                } else if (a.tag <= JS_TAG_UNDEFINED) {
+                    res = !a.cval.u.int32;
+                } else {
+                    JIT_BAIL(JIT_AL);
+                    res = 1;
+                }
+                jit_push_const(c, JS_NewBool(c->ctx, res));
+                break;
+            }
+            rr = jit_reg_alloc(c);
+            if (a.tag == JS_TAG_INT) {
+                je_fcmp_zero(&c->hot, a.reg);
+                je_cset_w(&c->hot, rr, JIT_EQ);
+                je_cset_w(&c->hot, 23, JIT_VS);
+                je_orr_w(&c->hot, rr, rr, 23);
+            } else {
+                je_cmp_wi(&c->hot, a.reg, 0);
+                je_cset_w(&c->hot, rr, JIT_EQ);
+            }
+            jit_push_reg(c, rr, JS_TAG_BOOL);
+            jit_release(c, a);
+        }
+        break;
+
+    case OP_add:
+    case OP_sub:
+    case OP_mul:
+    case OP_div:
+        {
+            LunaJVal b = jit_pop(c), a = jit_pop(c);
+            int rr;
+            JIT_BAIL_IF_NOT_NUM(a);
+            JIT_BAIL_IF_NOT_NUM(b);
+            if (a.kind == 0 && b.kind == 0) {
+                double x = jit_val_d(a), y = jit_val_d(b), r;
+                switch (op) {
+                case OP_add: r = x + y; break;
+                case OP_sub: r = x - y; break;
+                case OP_mul: r = x * y; break;
+                default: r = x / y; break;
+                }
+                jit_push_const(c, JS_NewFloat64(c->ctx, r));
+                break;
+            }
+            rr = jit_reg_alloc(c);
+            {
+                int ar = jit_num_reg(c, a, 23);
+                int br = jit_num_reg(c, b, 8);
+                switch (op) {
+                case OP_add: je_fadd(&c->hot, rr, ar, br); break;
+                case OP_sub: je_fsub(&c->hot, rr, ar, br); break;
+                case OP_mul: je_fmul(&c->hot, rr, ar, br); break;
+                default: je_fdiv(&c->hot, rr, ar, br); break;
+                }
+            }
+            jit_push_reg(c, rr, 0);
+            jit_release(c, a);
+            jit_release(c, b);
+        }
+        break;
+
+    case OP_mod:
+        {
+            LunaJVal b = jit_pop(c), a = jit_pop(c);
+            int rr;
+            JIT_BAIL_IF_NOT_NUM(a);
+            JIT_BAIL_IF_NOT_NUM(b);
+            if (a.kind == 0 && b.kind == 0) {
+                jit_push_const(c, JS_NewFloat64(c->ctx,
+                                                fmod(jit_val_d(a),
+                                                     jit_val_d(b))));
+                break;
+            }
+            /* fmod is out of line and clobbers the caller-saved register
+             * file: park the live stack, pass the operands in d0/d1, then
+             * rebuild the operand registers from memory. */
+            jit_spill_stack(c);
+            if (a.kind == 1) {
+                je_fmov_d_d(&c->hot, 16, a.reg);
+            } else {
+                je_mov64(&c->hot, 8, jit_dbits(jit_val_d(a)));
+                je_fmov_d_x(&c->hot, 16, 8);
+            }
+            if (b.kind == 1) {
+                je_fmov_d_d(&c->hot, 17, b.reg);
+            } else {
+                je_mov64(&c->hot, 8, jit_dbits(jit_val_d(b)));
+                je_fmov_d_x(&c->hot, 17, 8);
+            }
+            je_fmov_d_d(&c->hot, 0, 16);
+            je_fmov_d_d(&c->hot, 1, 17);
+            je_ldr_x(&c->hot, 9, 19, 64);
+            je_blr(&c->hot, 9);
+            je_fmov_x_d(&c->hot, 8, 0);
+            jit_reload_stack(c);
+            jit_release(c, a);
+            jit_release(c, b);
+            rr = jit_reg_alloc(c);
+            je_fmov_d_x(&c->hot, rr, 8);
+            jit_push_reg(c, rr, 0);
+        }
+        break;
+
+    case OP_lt:
+    case OP_lte:
+    case OP_gt:
+    case OP_gte:
+    case OP_eq:
+    case OP_neq:
+    case OP_strict_eq:
+    case OP_strict_neq:
+        {
+            LunaJVal b = jit_pop(c), a = jit_pop(c);
+            int rr, cond;
+            JIT_BAIL_IF_NOT_NUM(a);
+            JIT_BAIL_IF_NOT_NUM(b);
+            if (a.kind == 0 && b.kind == 0) {
+                double x = jit_val_d(a), y = jit_val_d(b);
+                int res;
+                switch (op) {
+                case OP_lt: res = (x < y); break;
+                case OP_lte: res = (x <= y); break;
+                case OP_gt: res = (x > y); break;
+                case OP_gte: res = (x >= y); break;
+                case OP_eq:
+                case OP_strict_eq: res = (x == y); break;
+                default: res = (x != y); break;
+                }
+                jit_push_const(c, JS_NewBool(c->ctx, res));
+                break;
+            }
+            {
+                int ar = jit_num_reg(c, a, 23);
+                int br = jit_num_reg(c, b, 8);
+                switch (op) {
+                case OP_lt: cond = JIT_MI; break;
+                case OP_lte: cond = JIT_LS; break;
+                case OP_gt: cond = JIT_GT; break;
+                case OP_gte: cond = JIT_GE; break;
+                case OP_eq:
+                case OP_strict_eq: cond = JIT_EQ; break;
+                default: cond = JIT_NE; break;
+                }
+                rr = jit_reg_alloc(c);
+                je_fcmp(&c->hot, ar, br);
+                je_cset_w(&c->hot, rr, cond);
+            }
+            jit_push_reg(c, rr, JS_TAG_BOOL);
+            jit_release(c, a);
+            jit_release(c, b);
+        }
+        break;
+
+    case OP_if_false:
+    case OP_if_true:
+#if SHORT_OPCODES
+    case OP_if_false8:
+    case OP_if_true8:
+#endif
+        {
+            LunaJVal a = jit_pop(c);
+            int target = jit_rel_target(c->bc, pc, luna_op_size_tab[c->bc[pc]]);
+            int taken = (op == OP_if_true || op == OP_if_true8);
+            if (a.kind == 0) {
+                int truthy;
+                if (a.tag == JS_TAG_FLOAT64) {
+                    double d = a.cval.u.float64;
+                    truthy = (d != 0 && !isnan(d));
+                } else if (a.tag <= JS_TAG_UNDEFINED) {
+                    truthy = (a.cval.u.int32 != 0);
+                } else {
+                    JIT_BAIL(JIT_AL);
+                    truthy = 0;
+                }
+                if (truthy == taken)
+                    jit_branch(c, JIT_AL, (uint32_t)target);
+                break;
+            }
+            if (a.tag == JS_TAG_INT) {
+                je_fcmp_zero(&c->hot, a.reg);
+                if (taken) {
+                    je_bcond(&c->hot, JIT_VS, 2); /* NaN is falsy */
+                    jit_branch(c, JIT_NE, (uint32_t)target);
+                } else {
+                    jit_branch(c, JIT_EQ, (uint32_t)target);
+                    jit_branch(c, JIT_VS, (uint32_t)target);
+                }
+            } else {
+                je_cmp_wi(&c->hot, a.reg, 0);
+                jit_branch(c, taken ? JIT_NE : JIT_EQ, (uint32_t)target);
+            }
+            jit_release(c, a);
+            if (c->vst_n != 0)
+                jit_mark_fail(c);
+        }
+        break;
+
+    case OP_goto:
+#if SHORT_OPCODES
+    case OP_goto16:
+    case OP_goto8:
+#endif
+        {
+            int target = jit_rel_target(c->bc, pc, luna_op_size_tab[c->bc[pc]]);
+            if ((uint32_t)target < pc)
+                jit_emit_poll(c, (uint32_t)target);
+            jit_branch(c, JIT_AL, (uint32_t)target);
+        }
+        break;
+
+    case OP_drop:
+        {
+            LunaJVal a = jit_pop(c);
+            jit_release(c, a);
+        }
+        break;
+    case OP_dup:
+        jit_dup_top(c);
+        break;
+    case OP_nop:
+        break;
+
+    case OP_return:
+        {
+            LunaJVal a = jit_pop(c);
+            if (a.kind == 1) {
+                if (a.tag == JS_TAG_INT)
+                    je_str_d(&c->hot, a.reg, 19, 32);
+                else
+                    je_str_x(&c->hot, a.reg, 19, 32);
+                je_mov64(&c->hot, 8,
+                         a.tag == JS_TAG_INT ? JS_TAG_FLOAT64 : a.tag);
+                je_str_x(&c->hot, 8, 19, 40);
+                jit_reg_release(c, a.reg);
+            } else {
+                jit_store_const(&c->hot, 19, 32, a.cval);
+            }
+            je_mov32(&c->hot, 0, 0);
+            luna_jit_epilogue(&c->hot);
+        }
+        break;
+    case OP_return_undef:
+        jit_store_const(&c->hot, 19, 32, JS_UNDEFINED);
+        je_mov32(&c->hot, 0, 0);
+        luna_jit_epilogue(&c->hot);
+        break;
+
+    default:
+        jit_mark_fail(c);
+        break;
+    }
+
+#undef JIT_BAIL
+#undef JIT_PUSH_NUM_CONST
+#undef JIT_NUM
+#undef JIT_BAIL_IF_NOT_NUM
+}
+
+/* ---------------- image assembly ---------------- */
+
+static size_t luna_jit_page_size(void)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0)
+        page = 4096;
+    return (size_t)page;
+}
+
+static int luna_jit_ncompiled;
+static int luna_jit_n_guard_trips;
+
+#ifdef LUNA_JIT_SELFTEST
+/* Test-only: the first compiled image is deliberately armed with a bad guard
+ * so the fallback path can be exercised without exposing code addresses. */
+static int luna_jit_selftest_armed;
+#endif
+
+static LunaJit *luna_jit_finish(LunaJCtx *c)
+{
+    JSContext *ctx = c->ctx;
+    LunaJit *j = NULL;
+    uint8_t *p;
+    size_t pg, len, mlen;
+    uint32_t gidx[LUNA_JIT_GUARD_N], gval[LUNA_JIT_GUARD_N];
+    int i;
+
+    if (c->fail || c->hot.oom || c->cold.oom)
+        return NULL;
+    if (c->hot.n == 0)
+        return NULL;
+
+    /* cold stubs live behind the hot code in the same image */
+    c->cold_base = (uint32_t)c->hot.n;
+    for (i = 0; i < c->cold.n; i++)
+        jc_emit(&c->hot, c->cold.w[i]);
+    if (c->hot.oom)
+        return NULL;
+
+    for (i = 0; i < c->fix_n; i++) {
+        LunaJFix *f = &c->fix[i];
+        int delta;
+        if (f->pc >= c->len || c->label[f->pc] == UINT32_MAX)
+            return NULL;
+        delta = (int)(c->label[f->pc] / 4) - (int)f->at;
+        if (f->cond == JIT_AL) {
+            if (delta < -(1 << 25) || delta >= (1 << 25))
+                return NULL;
+            c->hot.w[f->at] = 0x14000000u | ((uint32_t)delta & 0x3FFFFFF);
+        } else {
+            if (delta < -(1 << 18) || delta >= (1 << 18))
+                return NULL;
+            c->hot.w[f->at] = 0x54000000u |
+                (((uint32_t)delta & 0x7FFFF) << 5) | f->cond;
+        }
+    }
+    for (i = 0; i < c->cfix_n; i++) {
+        LunaJColdFix *f = &c->cfix[i];
+        int target = c->cold_base + (int)f->cold;
+        int delta = target - (int)f->at;
+        if (delta < -(1 << 25) || delta >= (1 << 25))
+            return NULL;
+        c->hot.w[f->at] = 0x14000000u | ((uint32_t)delta & 0x3FFFFFF);
+    }
+
+    len = (size_t)c->hot.n * 4;
+    pg = luna_jit_page_size();
+    mlen = (len + pg - 1) & ~(pg - 1);
+    p = mmap(NULL, mlen, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+        return NULL;
+    memcpy(p, c->hot.w, len);
+    {
+        uint32_t nw = (uint32_t)(len / 4);
+        for (i = 0; i < LUNA_JIT_GUARD_N; i++) {
+            uint32_t idx = (uint32_t)((uint64_t)nw * (uint32_t)i /
+                                      (LUNA_JIT_GUARD_N - 1));
+            if (idx >= nw)
+                idx = nw - 1;
+            gidx[i] = idx;
+            gval[i] = ((const uint32_t *)p)[idx];
+        }
+    }
+    __builtin___clear_cache((char *)p, (char *)p + len);
+    if (mprotect(p, mlen, PROT_READ | PROT_EXEC) != 0) {
+        munmap(p, mlen);
+        return NULL;
+    }
+    j = js_malloc(ctx, sizeof(*j));
+    if (!j) {
+        munmap(p, mlen);
+        return NULL;
+    }
+    j->code = p;
+    j->map_len = mlen;
+    j->fn = (int (*)(LunaJitArgs *))(void *)p;
+    for (i = 0; i < LUNA_JIT_GUARD_N; i++) {
+        j->guard_idx[i] = gidx[i];
+        j->guard_val[i] = gval[i];
+    }
+    j->guard_cursor = 0;
+#ifdef LUNA_JIT_SELFTEST
+    if (!luna_jit_selftest_armed) {
+        luna_jit_selftest_armed = 1;
+        j->guard_val[0] ^= 1;
+    }
+#endif
+    return j;
+}
+
+static LunaJit *luna_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
+{
+#if !defined(__aarch64__)
+    /* the native tier emits aarch64 machine code only */
+    (void)ctx;
+    (void)b;
+    return NULL;
+#else
+    LunaJCtx c;
+    LunaJit *j = NULL;
+    uint32_t pc;
+
+    if (getenv("LUNA_NOJIT") != NULL)
+        return NULL;
+    if (b->func_kind != JS_FUNC_NORMAL)
+        return NULL;
+    if (b->js_mode & JS_MODE_MATH)
+        return NULL;
+    if (b->is_direct_or_indirect_eval)
+        return NULL;
+    if (b->is_derived_class_constructor)
+        return NULL;
+    if (b->closure_var_count != 0)
+        return NULL;
+    if (b->byte_code_len <= 0 ||
+        (uint32_t)b->byte_code_len > LUNA_FULL_MAX)
+        return NULL;
+    if (b->arg_count * 16 + 8 > 16380 ||
+        b->var_count * 16 + 8 > 16380 ||
+        b->stack_size * 16 > 16380 ||
+        b->stack_size > LUNA_JIT_STACK_MAX)
+        return NULL;
+
+    memset(&c, 0, sizeof(c));
+    c.ctx = ctx;
+    c.b = b;
+    c.bc = b->byte_code_buf;
+    c.len = (uint32_t)b->byte_code_len;
+    c.hot.ctx = c.cold.ctx = ctx;
+
+    luna_build_opcode_tables();
+    if (!jit_analyze(&c)) {
+        jit_mark_fail(&c);
+        goto done;
+    }
+
+    /* prologue */
+    jc_emit(&c.hot, 0xA9BA7BFDu); /* stp x29, x30, [sp, #-96]! */
+    jc_emit(&c.hot, 0x910003FDu); /* mov x29, sp */
+    jc_emit(&c.hot, 0xA90153F3u); /* stp x19, x20, [sp, #16] */
+    jc_emit(&c.hot, 0xA9025BF5u); /* stp x21, x22, [sp, #32] */
+    jc_emit(&c.hot, 0xA90363F7u); /* stp x23, x24, [sp, #48] */
+    je_mov_rr(&c.hot, 19, 0);
+    je_ldr_x(&c.hot, 20, 19, 8);
+    je_ldr_x(&c.hot, 21, 19, 16);
+    je_ldr_x(&c.hot, 22, 19, 24);
+    je_movz64(&c.hot, 24, LUNA_JIT_POLL_TICKS, 0);
+
+    for (pc = 0; pc < c.len; pc += (uint32_t)luna_op_size_tab[c.bc[pc]]) {
+        int size = luna_op_size_tab[c.bc[pc]];
+        if (size == 0 || pc + (uint32_t)size > c.len) {
+            jit_mark_fail(&c);
+            break;
+        }
+        if (c.depth[pc] < 0)
+            continue;
+        c.label[pc] = (uint32_t)c.hot.n * 4;
+        if (c.vst_n != c.depth[pc]) {
+            jit_mark_fail(&c);
+            break;
+        }
+        jit_emit_op(&c, pc, size);
+        if (c.fail)
+            break;
+    }
+
+    if (!c.fail && !c.hot.oom && !c.cold.oom) {
+        if (getenv("LUNA_JIT_TRACE")) {
+            fprintf(stderr, "[luna-jit] compile atom=%u bytes=%u hot=%u cold=%u bails=%d\n",
+                    (unsigned)b->func_name, (unsigned)c.len,
+                    (unsigned)(c.hot.n * 4), (unsigned)(c.cold.n * 4), c.n_bails);
+        }
+        j = luna_jit_finish(&c);
+        if (j)
+            luna_jit_ncompiled++;
+    }
+
+done:
+    js_free(ctx, c.hot.w);
+    js_free(ctx, c.cold.w);
+    js_free(ctx, c.depth);
+    js_free(ctx, c.label);
+    js_free(ctx, c.fix);
+    js_free(ctx, c.cfix);
+    return j;
+#endif
+}
+
+static int luna_jit_run(JSFunctionBytecode *b, LunaJitArgs *a)
+{
+    LunaJit *j = b->luna_jit;
+    const uint32_t *w;
+    uint32_t sel;
+
+    if (!j)
+        return 1;
+    /* Verify the prologue plus one rotating sample.  Both loads hit RX pages
+     * that are already hot; the cost is a few cycles per native call. */
+    sel = 1 + (uint32_t)(j->guard_cursor % (LUNA_JIT_GUARD_N - 1));
+    j->guard_cursor++;
+    w = (const uint32_t *)j->code;
+    if (unlikely(w[j->guard_idx[0]] != j->guard_val[0] ||
+                 w[j->guard_idx[sel]] != j->guard_val[sel])) {
+        luna_jit_n_guard_trips++;
+        b->luna_jit = NULL;
+        luna_jit_free(a->ctx->rt, j);
+        return 1;
+    }
+    a->poll_fn = (void *)luna_jit_poll;
+    a->mod_fn = (void *)luna_jit_fmod;
+    return j->fn(a);
+}
+
+static void luna_jit_free(JSRuntime *rt, LunaJit *j)
+{
+    if (!j)
+        return;
+    if (j->code)
+        munmap(j->code, j->map_len);
+    js_free_rt(rt, j);
+}
+
+/* number of functions compiled to native code since startup (test hook) */
+int luna_jit_compiled_count(void)
+{
+    return luna_jit_ncompiled;
+}
+
+/* number of native images discarded after an integrity mismatch (test hook) */
+int luna_jit_guard_trip_count(void)
+{
+    return luna_jit_n_guard_trips;
 }
 
 static __exception int next_token(JSParseState *s);
@@ -36070,6 +38243,9 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 {
     int i;
 
+    luna_jit_free(rt, b->luna_jit);
+    b->luna_jit = NULL;
+
 #if 0
     {
         char buf[ATOM_GET_STR_BUF_SIZE];
@@ -36102,7 +38278,6 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 
             for (luna_ici = 0; luna_ici < LUNA_IC_COUNT; luna_ici++) {
                 if (b->luna_ic[luna_ici].shape) {
-                    fprintf(stderr, "REL %p\n", (void *)b->luna_ic[luna_ici].shape);
                     js_free_shape(rt, b->luna_ic[luna_ici].shape);
                 }
             }

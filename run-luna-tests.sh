@@ -23,6 +23,24 @@ $CC -O2 -g -Wall -o "$BUILD/luna_engine_test" luna_engine_test.c quickjs.c \
     -DCONFIG_VERSION="\"test\"" -DCONFIG_BIGNUM -D_GNU_SOURCE -lm -ldl -lpthread
 "$BUILD/luna_engine_test"
 
+case "$(uname -m)" in
+aarch64|arm64)
+    echo "== JIT differential (native tier vs stock, deopt paths) =="
+    $CC -O2 -g -Wall -o "$BUILD/luna_jit_test" luna_jit_test.c quickjs.c \
+        libregexp.c libunicode.c cutils.c libbf.c quickjs-libc.c luna_bc.c \
+        -DCONFIG_VERSION="\"test\"" -DCONFIG_BIGNUM -D_GNU_SOURCE -lm -ldl -lpthread
+    "$BUILD/luna_jit_test"
+    LUNA_NOJIT=1 "$BUILD/luna_jit_test"
+    echo "== JIT image guard (deliberate mismatch must self-heal) =="
+    $CC -O2 -g -Wall -o "$BUILD/luna_jit_selftest" -DLUNA_JIT_SELFTEST \
+        luna_jit_test.c quickjs.c libregexp.c libunicode.c cutils.c libbf.c \
+        quickjs-libc.c luna_bc.c \
+        -DCONFIG_VERSION="\"test\"" -DCONFIG_BIGNUM -D_GNU_SOURCE -lm -ldl -lpthread
+    "$BUILD/luna_jit_selftest"
+    LUNA_NOJIT=1 "$BUILD/luna_jit_selftest"
+    ;;
+esac
+
 echo "== mod loader tests (discovery, deps, cross mod imports) =="
 $CC -O2 -g -Wall -o "$BUILD/luna_mods_test" -DLUNA_GC_DEBUG \
     luna_mods_test.c luna_mods.c quickjs.c libregexp.c libunicode.c cutils.c \
