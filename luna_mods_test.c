@@ -93,8 +93,8 @@ static void write_file(const char *path, const char *data)
     fclose(f);
 }
 
-static void write_manifest(const char *dir, const char *name, const char *version,
-                           const char *author, const char *deps)
+static void write_manifest_full(const char *dir, const char *name, const char *version,
+                                const char *author, const char *deps, const char *extra)
 {
     char path[1024], json[2048];
 
@@ -112,15 +112,51 @@ static void write_manifest(const char *dir, const char *name, const char *versio
              "  \"name\": \"%s\",\n"
              "  \"version\": \"%s\",\n"
              "  \"author\": \"%s\",\n"
-             "  \"dependencies\": [%s],\n"
+             "  \"dependencies\": [%s]%s%s,\n"
              "  \"icon\": \"icon.png\",\n"
              "  \"entrypoint\": \"main.luna\"\n"
              "}\n",
-             name, version, author, deps ? deps : "");
+             name, version, author, deps ? deps : "",
+             extra ? ",\n  " : "",
+             extra ? extra : "");
     snprintf(path, sizeof(path), "%s/manifest.json", dir);
     write_file(path, json);
     snprintf(path, sizeof(path), "%s/icon.png", dir);
     write_file(path, "\x89PNG fake icon");
+}
+
+static void write_manifest(const char *dir, const char *name, const char *version,
+                           const char *author, const char *deps)
+{
+    write_manifest_full(dir, name, version, author, deps, NULL);
+}
+
+static void compile_mod(const char *src_path, const char *out_path, const char *label);
+
+/* One mod package: manifest, icon, source, compiled container. */
+static void make_mod(const char *root, const char *dirname, const char *name,
+                     const char *version, const char *deps, const char *extra,
+                     const char *src)
+{
+    char dir[1024], src_path[1024], obj[1024];
+
+    snprintf(dir, sizeof(dir), "%s/%s", root, dirname);
+    write_manifest_full(dir, name, version, "luna", deps, extra);
+    snprintf(src_path, sizeof(src_path), "%s/main.js", dir);
+    write_file(src_path, src);
+    snprintf(obj, sizeof(obj), "%s/main.luna", dir);
+    compile_mod(src_path, obj, name);
+}
+
+static LunaModInfo *find_info(LunaModInfo *info, size_t count, const char *name)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        if (strcmp(info[i].name, name) == 0)
+            return &info[i];
+    }
+    return NULL;
 }
 
 /* compile a JS source into a Luna container with the given anti-mod label */
@@ -159,6 +195,144 @@ static void compile_mod(const char *src_path, const char *out_path, const char *
         }
         exit(1);
     }
+}
+
+static const char *mod_tag_src = "export const tag = 'x';\n";
+
+/*
+ * Second tree: requirement aware version selection, conflicts, optional
+ * dependencies, the loader API gate, explicit load order and cycle reports.
+ */
+static void run_dependency_scenarios(JSContext *ctx, const char *base)
+{
+    char root[768], app[768];
+    const char *roots[2];
+    LunaMods *mods, *again;
+    LunaModInfo *info = NULL, *info2 = NULL;
+    size_t count = 0, count2 = 0, i;
+    char err[512];
+    LunaModInfo *m;
+    int rc;
+
+    snprintf(root, sizeof(root), "%s/deps/assets", base);
+    snprintf(app, sizeof(app), "%s/deps/appdata", base);
+    roots[0] = root;
+    roots[1] = app;
+
+    make_mod(root, "a", "mod.a", "1.0.0", "\"mod.b@^1.0.0\"", NULL, mod_tag_src);
+    make_mod(root, "b-2.0.0", "mod.b", "2.0.0", "", NULL, mod_tag_src);
+    make_mod(root, "b-1.0.0", "mod.b", "1.0.0", "", NULL, mod_tag_src);
+    make_mod(root, "c", "mod.c", "1.0.0", "\"mod.d@^2.0.0\"", NULL, mod_tag_src);
+    make_mod(root, "e", "mod.e", "1.0.0", "\"mod.d@^1.0.0\"", NULL, mod_tag_src);
+    make_mod(root, "d-2.0.0", "mod.d", "2.0.0", "", NULL, mod_tag_src);
+    make_mod(root, "d-1.0.0", "mod.d", "1.0.0", "", NULL, mod_tag_src);
+    make_mod(root, "conflict1", "mod.conflict1", "1.0.0", "",
+             "\"conflicts\": [\"mod.conflict2@1.x\"]", mod_tag_src);
+    make_mod(root, "conflict2", "mod.conflict2", "1.0.0", "", NULL, mod_tag_src);
+    make_mod(root, "opt", "mod.opt", "1.0.0", "",
+             "\"optionalDependencies\": [\"mod.ghost@^1.0.0\"]", mod_tag_src);
+    make_mod(root, "gate-ok", "mod.gate-ok", "1.0.0", "\"luna@>=1.0.0\"", NULL, mod_tag_src);
+    make_mod(root, "gate-bad", "mod.gate-bad", "1.0.0", "\"luna@>=99.0.0\"", NULL, mod_tag_src);
+    make_mod(root, "order-a", "mod.order.a", "1.0.0", "",
+             "\"loadAfter\": [\"mod.order.z\"]",
+             "globalThis.__luna_order = (globalThis.__luna_order || []).concat(['a']);\n"
+             "export const tag = 'a';\n");
+    make_mod(root, "order-z", "mod.order.z", "1.0.0", "", NULL,
+             "globalThis.__luna_order = (globalThis.__luna_order || []).concat(['z']);\n"
+             "export const tag = 'z';\n");
+    make_mod(root, "cyc-x", "mod.cyc.x", "1.0.0", "\"mod.cyc.y\"", NULL, mod_tag_src);
+    make_mod(root, "cyc-y", "mod.cyc.y", "1.0.0", "\"mod.cyc.x\"", NULL, mod_tag_src);
+
+    mods = luna_mods_create(ctx);
+    rc = luna_mods_load(mods, roots, 2, app, antimod(NULL), &info, &count, err, sizeof(err));
+    check(rc == 0, "dependency scenario load succeeds");
+    check(count == 14, "dependency scenario discovers 14 packages");
+    if (rc == 0) {
+        for (i = 1; i < count; i++) {
+            if (strcmp(info[i - 1].name, info[i].name) >= 0)
+                break;
+        }
+        check(i == count, "packages come back in name order");
+
+        m = find_info(info, count, "mod.a");
+        check(m && m->loaded, "a loads");
+        m = find_info(info, count, "mod.b");
+        check(m && m->version && strcmp(m->version, "1.0.0") == 0,
+              "selection downgrades b to the newest copy a can use");
+        check(m && m->loaded, "b loads");
+        m = find_info(info, count, "mod.c");
+        check(m && m->loaded, "c loads");
+        m = find_info(info, count, "mod.d");
+        check(m && m->loaded && m->version && strcmp(m->version, "2.0.0") == 0,
+              "d keeps the newest copy when requirements conflict");
+        m = find_info(info, count, "mod.e");
+        check(m && m->failed, "e fails when nothing satisfies d@^1.0.0");
+        if (m && m->error) {
+            check(strstr(m->error, "mod.d@^1.0.0") != NULL, "mismatch names the requirement");
+            check(strstr(m->error, "2.0.0") != NULL, "mismatch names the selected version");
+            check(strstr(m->error, "mod.c") != NULL, "mismatch names the blocking mod");
+        }
+        m = find_info(info, count, "mod.conflict1");
+        check(m && m->failed && m->error &&
+              strstr(m->error, "conflicts with 'mod.conflict2'") != NULL,
+              "conflicts refuse to load and name the mod");
+        m = find_info(info, count, "mod.conflict2");
+        check(m && m->loaded, "the other side of a conflict still loads");
+        m = find_info(info, count, "mod.opt");
+        check(m && m->loaded, "optional dependency on a missing mod is fine");
+        m = find_info(info, count, "mod.gate-ok");
+        check(m && m->loaded, "loader API range satisfied");
+        m = find_info(info, count, "mod.gate-bad");
+        check(m && m->failed && m->error && strstr(m->error, "loader API") != NULL,
+              "loader API range checked");
+        m = find_info(info, count, "mod.cyc.x");
+        check(m && m->failed && m->error && strstr(m->error, "cycle") != NULL,
+              "cycle members report the cycle");
+        m = find_info(info, count, "mod.cyc.y");
+        check(m && m->failed, "both cycle members fail");
+
+        {
+            const char *code = "JSON.stringify(globalThis.__luna_order || [])";
+            JSValue res = JS_Eval(ctx, code, strlen(code), "<order>", JS_EVAL_TYPE_GLOBAL);
+
+            check(!JS_IsException(res), "order log readable");
+            if (!JS_IsException(res)) {
+                const char *s = JS_ToCString(ctx, res);
+
+                check(s && strcmp(s, "[\"z\",\"a\"]") == 0, "loadAfter defers evaluation");
+                if (s)
+                    JS_FreeCString(ctx, s);
+            } else {
+                js_std_dump_error(ctx);
+            }
+            JS_FreeValue(ctx, res);
+        }
+    }
+
+    /* scanning the same tree again picks the same versions and order */
+    again = luna_mods_create(ctx);
+    rc = luna_mods_load(again, roots, 2, app, antimod(NULL), &info2, &count2, err, sizeof(err));
+    check(rc == 0 && count2 == count, "second load discovers the same packages");
+    if (rc == 0 && count2 == count) {
+        int same = 1;
+
+        for (i = 0; i < count; i++) {
+            if (strcmp(info[i].name, info2[i].name) != 0 ||
+                strcmp(info[i].version, info2[i].version) != 0 ||
+                info[i].loaded != info2[i].loaded ||
+                info[i].failed != info2[i].failed) {
+                same = 0;
+                break;
+            }
+        }
+        check(same, "resolution is deterministic across loads");
+    }
+    if (info2)
+        luna_mods_free_info(info2, count2);
+    luna_mods_destroy(again);
+    if (info)
+        luna_mods_free_info(info, count);
+    luna_mods_destroy(mods);
 }
 
 int main(void)
@@ -348,6 +522,9 @@ int main(void)
         luna_mods_destroy(guarded);
     }
 
+    /* requirement aware resolution, conflicts, load order, cycles */
+    run_dependency_scenarios(ctx, base);
+
     /* version helpers */
     check(luna_version_cmp("1.2.3", "1.2.4") < 0, "1.2.3 < 1.2.4");
     check(luna_version_cmp("1.10.0", "1.9.9") > 0, "1.10.0 > 1.9.9");
@@ -361,6 +538,26 @@ int main(void)
     check(luna_version_matches("1.2.3", "") == 1, "empty spec matches anything");
     check(luna_version_matches("1.2.3", ">1.2.2") == 1, "> accepts");
     check(luna_version_matches("1.2.3", "<=1.2.3") == 1, "<= accepts equal");
+    check(luna_version_cmp("1.2", "1.2.0") == 0, "missing components count as zero");
+    check(luna_version_matches("0.2.9", "^0.2.3") == 1, "^0.2.3 accepts 0.2.9");
+    check(luna_version_matches("0.2.2", "^0.2.3") == 0, "^0.2.3 rejects older patches");
+    check(luna_version_matches("0.3.0", "^0.2.3") == 0, "^0.2.3 rejects 0.3.0");
+    check(luna_version_matches("0.0.3", "^0.0.3") == 1, "^0.0.3 accepts itself");
+    check(luna_version_matches("0.0.4", "^0.0.3") == 0, "^0.0.4 is out of the caret range");
+    check(luna_version_matches("1.2.9", "~1.2.3") == 1, "~1.2.3 accepts patch bumps");
+    check(luna_version_matches("1.3.0", "~1.2.3") == 0, "~1.2.3 rejects minor bumps");
+    check(luna_version_matches("1.2.2", "~1.2.3") == 0, "~1.2.3 rejects older patches");
+    check(luna_version_matches("1.9.9", "1.x") == 1, "1.x accepts");
+    check(luna_version_matches("2.0.0", "1.x") == 0, "1.x rejects the next major");
+    check(luna_version_matches("1.2.99", "1.2.x") == 1, "1.2.x accepts");
+    check(luna_version_matches("1.3.0", "1.2.x") == 0, "1.2.x rejects the next minor");
+    check(luna_version_matches("1.5.0", ">=1.0.0 <2.0.0") == 1, "space separated terms are AND");
+    check(luna_version_matches("2.0.0", ">=1.0.0 <2.0.0") == 0, "AND upper bound enforced");
+    check(luna_version_matches("2.5.0", "1.x || 2.x") == 1, "|| alternatives");
+    check(luna_version_matches("3.0.0", "1.x || 2.x") == 0, "|| rejects outside them");
+    check(luna_version_matches("4.5.6", "*") == 1, "* matches anything");
+    check(luna_version_matches("1.2.5", "1.2") == 1, "partial spec accepts patch siblings");
+    check(luna_version_matches("1.3.0", "1.2") == 0, "partial spec rejects the next minor");
 
     /* wrong anti-mod data makes every container fail to load */
     {

@@ -1,10 +1,22 @@
 /*
  * Luna mod loader.
  *
- * Discovers mod packages on disk, picks the newest copy of each one, copies
- * read-only (APK asset) copies into the app data directory when needed,
- * resolves the dependency graph declared by manifest.json and evaluates the
- * entrypoint bytecode of every mod in dependency order.
+ * Discovers mod packages on disk, resolves one version per package with
+ * requirement aware selection, copies read-only (APK asset) copies into the
+ * app data directory when needed, and evaluates the entrypoint bytecode of
+ * every mod in dependency order.
+ *
+ * Selection: every installed copy of a package is a candidate. The loader
+ * picks the copy that lets the most mods load, then satisfies the most
+ * requirements, then is newest, so a dependent can hold a package back to an
+ * older copy instead of failing. The result is deterministic and independent
+ * of directory iteration order.
+ *
+ * manifest.json understands dependencies (required), optionalDependencies
+ * (soft, never fail), conflicts/breaks (refuse to load while a match is
+ * selected), loadBefore/loadAfter (evaluation order when both are present)
+ * and a dependency on the synthetic package "luna" for the loader API
+ * version. Range grammar and semantics are documented in luna_mods.c.
  *
  * Every mod is an ES module, so "exports" are the module exports object and
  * mods consume each other with plain import statements. The registry is also
@@ -25,6 +37,14 @@ extern "C" {
 
 #define LUNA_MODS_MANIFEST "manifest.json"
 #define LUNA_MODS_FORMAT   1
+
+/*
+ * Loader API version. Mods can depend on the synthetic package
+ * LUNA_MODS_API_NAME: "dependencies": ["luna@>=1.0.0"] fails the mod early
+ * when it needs a newer loader than this one.
+ */
+#define LUNA_MODS_API_NAME    "luna"
+#define LUNA_MODS_API_VERSION "1.0.0"
 
 typedef struct LunaMods LunaMods;
 
