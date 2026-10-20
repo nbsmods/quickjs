@@ -286,6 +286,40 @@ static void test_container(void)
         rc = luna_bc_unpack(packed, packed_len - 5, &am, &p2, &l2, NULL, err, sizeof(err));
         check(rc == LUNA_BC_ERR_LENGTH, "truncated container rejected");
     }
+    /* trailing bytes are not covered by the tag, so the format rejects them */
+    {
+        uint8_t *padded = (uint8_t *)malloc(packed_len + 1);
+        uint8_t *p2 = NULL;
+        size_t l2 = 0;
+        memcpy(padded, packed, packed_len);
+        padded[packed_len] = 0xaa;
+        rc = luna_bc_unpack(padded, packed_len + 1, &am, &p2, &l2, NULL, err, sizeof(err));
+        check(rc == LUNA_BC_ERR_LENGTH, "trailing bytes rejected");
+        free(padded);
+    }
+    /* the two step API must not underflow when handed a short buffer */
+    {
+        LunaBCHeader h;
+        uint8_t dk[LUNA_BC_DK_LEN];
+        uint8_t *p2 = NULL;
+        size_t l2 = 0;
+
+        rc = luna_bc_unpack_begin(packed, packed_len, &am, &h, dk, err, sizeof(err));
+        check(rc == LUNA_BC_OK, "unpack begin succeeds");
+        if (rc == LUNA_BC_OK) {
+            rc = luna_bc_unpack_finish(packed, 10, &h, dk, &p2, &l2, err, sizeof(err));
+            check(rc == LUNA_BC_ERR_LENGTH, "short buffer rejected without underflow");
+        }
+    }
+    /* reserved header bits must stay zero */
+    {
+        uint8_t *tampered = (uint8_t *)malloc(packed_len);
+        memcpy(tampered, packed, packed_len);
+        tampered[7] = 1;
+        rc = luna_bc_parse_header(tampered, packed_len, &hdr, err, sizeof(err));
+        check(rc == LUNA_BC_ERR_VERSION, "reserved header bits rejected");
+        free(tampered);
+    }
     /* not a container at all */
     {
         uint8_t *p2 = NULL;

@@ -663,8 +663,14 @@ int luna_bc_unpack_finish(const uint8_t *buf, size_t len, const LunaBCHeader *hd
         luna_bc_set_err(err, err_cap, "invalid arguments");
         return LUNA_BC_ERR_ARGUMENT;
     }
-    if (hdr->payload_len > len - LUNA_BC_HEADER_SIZE) {
+    if (len < LUNA_BC_HEADER_SIZE) {
         luna_bc_set_err(err, err_cap, "truncated container");
+        return LUNA_BC_ERR_LENGTH;
+    }
+    /* the tag authenticates exactly payload_len ciphertext bytes, so extra
+     * trailing bytes are neither authenticated nor part of the format */
+    if (hdr->payload_len != len - LUNA_BC_HEADER_SIZE) {
+        luna_bc_set_err(err, err_cap, "container length mismatch");
         return LUNA_BC_ERR_LENGTH;
     }
 
@@ -746,6 +752,10 @@ int luna_bc_parse_header(const uint8_t *buf, size_t len, LunaBCHeader *hdr,
     hdr->reserved = buf[7];
     if (hdr->version != LUNA_BC_VERSION) {
         luna_bc_set_err(err, err_cap, "unsupported container version");
+        return LUNA_BC_ERR_VERSION;
+    }
+    if (hdr->reserved != 0) {
+        luna_bc_set_err(err, err_cap, "unsupported reserved header bits");
         return LUNA_BC_ERR_VERSION;
     }
     if (hdr->kdf_shift < LUNA_BC_KDF_SHIFT_MIN || hdr->kdf_shift > LUNA_BC_KDF_SHIFT_MAX) {
