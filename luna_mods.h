@@ -13,10 +13,18 @@
  * of directory iteration order.
  *
  * manifest.json understands dependencies (required), optionalDependencies
- * (soft, never fail), conflicts/breaks (refuse to load while a match is
- * selected), loadBefore/loadAfter (evaluation order when both are present)
- * and a dependency on the synthetic package "luna" for the loader API
- * version. Range grammar and semantics are documented in luna_mods.c.
+ * (soft: prefer a compatible copy when one is installed, warn when not,
+ * never fail), conflicts/breaks (refuse to load while a match is selected),
+ * loadBefore/loadAfter (evaluation order when both are present) and a
+ * dependency on the synthetic package "luna" for the loader API version.
+ * Range grammar and semantics are documented in luna_mods.c.
+ *
+ * Manifests are validated before anything is copied or evaluated: package
+ * names are restricted to a path safe character set, versions must be dotted
+ * numeric with an optional prerelease, entrypoint/icon paths must stay inside
+ * the package directory and every dependency must carry a parseable
+ * requirement. A directory with an unusable manifest is reported as a failed
+ * entry in the load result instead of silently disappearing.
  *
  * Every mod is an ES module, so "exports" are the module exports object and
  * mods consume each other with plain import statements. The registry is also
@@ -62,7 +70,7 @@ LunaMods *luna_mods_create(JSContext *ctx);
 void luna_mods_destroy(LunaMods *m);
 
 typedef struct LunaModInfo {
-    char *name;     /* package name */
+    char *name;     /* package name, or directory name for an invalid manifest */
     char *version;
     char *author;
     char *icon;     /* manifest declared icon, may be NULL */
@@ -72,6 +80,13 @@ typedef struct LunaModInfo {
     int loaded;     /* evaluated successfully */
     int failed;     /* evaluation failed or a dependency failed */
     char *error;    /* NULL when everything went fine */
+    /*
+     * Soft dependency diagnostics (missing or incompatible
+     * optionalDependencies, optional packages that failed to load). Warnings
+     * never change whether a mod loads; warning_count is zero when none.
+     */
+    char **warnings;
+    size_t warning_count;
 } LunaModInfo;
 
 /*
@@ -86,7 +101,14 @@ typedef struct LunaModInfo {
  * deployment channel for /data/data/<pkg>/files/luna/mods.
  *
  * On success *out receives a malloc()ed array of *out_count entries that the
- * caller frees with luna_mods_free_info().
+ * caller frees with luna_mods_free_info(). The first rows are the resolved
+ * packages in package name order; when manifests were rejected, one failed
+ * row per bad directory follows (name = directory basename, error explains
+ * why it was rejected), sorted by directory.
+ *
+ * A loader performs one load; use a fresh LunaMods to rescan after mods
+ * change, so stale modules can never stay registered behind the caller's
+ * back.
  */
 int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
                    const char *writable_root, const LunaAntiModData *am,

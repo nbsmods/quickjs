@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 static int probe_fail(void *user_data)
 {
@@ -231,6 +232,12 @@ static void run_dependency_scenarios(JSContext *ctx, const char *base)
     make_mod(root, "conflict2", "mod.conflict2", "1.0.0", "", NULL, mod_tag_src);
     make_mod(root, "opt", "mod.opt", "1.0.0", "",
              "\"optionalDependencies\": [\"mod.ghost@^1.0.0\"]", mod_tag_src);
+    make_mod(root, "opt2", "mod.opt2", "1.0.0", "",
+             "\"optionalDependencies\": [\"mod.b@2.x\"]", mod_tag_src);
+    make_mod(root, "opt3", "mod.opt3", "1.0.0", "",
+             "\"optionalDependencies\": [\"mod.f@1.x\"]", mod_tag_src);
+    make_mod(root, "f-2.0.0", "mod.f", "2.0.0", "", NULL, mod_tag_src);
+    make_mod(root, "f-1.0.0", "mod.f", "1.0.0", "", NULL, mod_tag_src);
     make_mod(root, "gate-ok", "mod.gate-ok", "1.0.0", "\"luna@>=1.0.0\"", NULL, mod_tag_src);
     make_mod(root, "gate-bad", "mod.gate-bad", "1.0.0", "\"luna@>=99.0.0\"", NULL, mod_tag_src);
     make_mod(root, "order-a", "mod.order.a", "1.0.0", "",
@@ -246,7 +253,7 @@ static void run_dependency_scenarios(JSContext *ctx, const char *base)
     mods = luna_mods_create(ctx);
     rc = luna_mods_load(mods, roots, 2, app, antimod(NULL), &info, &count, err, sizeof(err));
     check(rc == 0, "dependency scenario load succeeds");
-    check(count == 14, "dependency scenario discovers 14 packages");
+    check(count == 17, "dependency scenario discovers 17 packages");
     if (rc == 0) {
         for (i = 1; i < count; i++) {
             if (strcmp(info[i - 1].name, info[i].name) >= 0)
@@ -280,6 +287,21 @@ static void run_dependency_scenarios(JSContext *ctx, const char *base)
         check(m && m->loaded, "the other side of a conflict still loads");
         m = find_info(info, count, "mod.opt");
         check(m && m->loaded, "optional dependency on a missing mod is fine");
+        check(m && m->warning_count == 1 && m->warnings[0] &&
+              strstr(m->warnings[0], "mod.ghost") != NULL,
+              "missing optional dependency is reported as a warning");
+        m = find_info(info, count, "mod.opt2");
+        check(m && m->loaded, "optional dependency with a mismatching copy is fine");
+        check(m && m->warning_count == 1 && m->warnings[0] &&
+              strstr(m->warnings[0], "mod.b") != NULL &&
+              strstr(m->warnings[0], "1.0.0") != NULL,
+              "mismatched optional dependency names the selected version");
+        m = find_info(info, count, "mod.f");
+        check(m && m->loaded && m->version && strcmp(m->version, "1.0.0") == 0,
+              "an optional requirement can hold a package back when it breaks no tie");
+        m = find_info(info, count, "mod.opt3");
+        check(m && m->loaded && m->warning_count == 0,
+              "satisfied optional dependency produces no warning");
         m = find_info(info, count, "mod.gate-ok");
         check(m && m->loaded, "loader API range satisfied");
         m = find_info(info, count, "mod.gate-bad");
@@ -329,10 +351,166 @@ static void run_dependency_scenarios(JSContext *ctx, const char *base)
     }
     if (info2)
         luna_mods_free_info(info2, count2);
+    /* a second load would keep stale modules registered, so it is refused */
+    rc = luna_mods_load(again, roots, 2, app, antimod(NULL), &info2, &count2,
+                        err, sizeof(err));
+    check(rc != 0 && strstr(err, "already") != NULL,
+          "a loader refuses a second load");
     luna_mods_destroy(again);
     if (info)
         luna_mods_free_info(info, count);
     luna_mods_destroy(mods);
+}
+
+static void mkdir_p(const char *path)
+{
+    char tmp[1024];
+    size_t len;
+    char *p;
+
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    len = strlen(tmp);
+    while (len > 1 && tmp[len - 1] == '/')
+        tmp[--len] = '\0';
+    for (p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+static void make_raw_mod(const char *root, const char *dirname, const char *json)
+{
+    char dir[1024], path[1024];
+
+    mkdir_p(root);
+    snprintf(dir, sizeof(dir), "%s/%s", root, dirname);
+    mkdir_p(dir);
+    snprintf(path, sizeof(path), "%s/manifest.json", dir);
+    write_file(path, json);
+}
+
+/*
+ * Rejected manifests must be visible, and nothing from them may be copied
+ * before validation. A name such as "../escape-pwn" used to be able to place
+ * the materialized copy outside the writable root.
+ */
+static void run_manifest_validation(JSContext *ctx, const char *base)
+{
+    char bad[768], root[768], app[768], path[1024], onlyroot[768], err[512];
+    const char *roots[1];
+    const char *names[7] = {
+        "escape", "badjson", "badver", "baddep", "badentry", "badlist", "reserved"
+    };
+    const char *needles[7] = {
+        "invalid package name", "", "invalid version", "invalid dependency name",
+        "invalid entrypoint path", "must be an array", "reserved"
+    };
+    LunaMods *mods;
+    LunaModInfo *info = NULL;
+    size_t count = 0, i;
+    int rc;
+
+    snprintf(bad, sizeof(bad), "%s/bad", base);
+    snprintf(root, sizeof(root), "%s/assets", bad);
+    snprintf(app, sizeof(app), "%s/appdata", bad);
+    mkdir_p(root);
+    mkdir_p(app);
+
+    make_raw_mod(root, "escape",
+                 "{\"name\":\"../escape-pwn\",\"version\":\"1.0.0\"}");
+    make_raw_mod(root, "badjson",
+                 "{\"name\":\"bad.json\",\"version\":\"1.0.0\",");
+    make_raw_mod(root, "badver",
+                 "{\"name\":\"bad.version\",\"version\":\"1.0.0.0.0\"}");
+    make_raw_mod(root, "baddep",
+                 "{\"name\":\"bad.dep\",\"version\":\"1.0.0\","
+                 "\"dependencies\":[\"../evil@1.0\"]}");
+    make_raw_mod(root, "badentry",
+                 "{\"name\":\"bad.entry\",\"version\":\"1.0.0\","
+                 "\"entrypoint\":\"../main.luna\"}");
+    make_raw_mod(root, "badlist",
+                 "{\"name\":\"bad.list\",\"version\":\"1.0.0\","
+                 "\"dependencies\":\"oops\"}");
+    make_raw_mod(root, "reserved",
+                 "{\"name\":\"luna\",\"version\":\"1.0.0\"}");
+    make_mod(root, "valid", "mod.valid", "1.0.0", "", NULL, mod_tag_src);
+
+    mods = luna_mods_create(ctx);
+    roots[0] = root;
+    rc = luna_mods_load(mods, roots, 1, app, antimod(NULL), &info, &count,
+                        err, sizeof(err));
+    check(rc == 0, "a tree with rejected manifests still loads");
+    check(count == 8, "valid package plus seven rejected manifests are reported");
+    if (rc == 0) {
+        LunaModInfo *m = find_info(info, count, "mod.valid");
+
+        check(m && m->loaded, "the valid package in the tree still loads");
+        for (i = 0; i < 7; i++) {
+            m = find_info(info, count, names[i]);
+            check(m && m->failed && m->error != NULL,
+                  "rejected manifest has a failed info row");
+            check(m && m->error && strstr(m->error, needles[i]) != NULL,
+                  "rejected manifest error explains the problem");
+        }
+        check(luna_mods_count(mods) == 1,
+              "rejected manifests are not registered as packages");
+        /* the traversal attempt must not materialize outside the writable root */
+        snprintf(path, sizeof(path), "%s/escape-pwn", bad);
+        check(access(path, F_OK) != 0,
+              "a package name cannot escape the writable root");
+        snprintf(path, sizeof(path), "%s/evil", bad);
+        check(access(path, F_OK) != 0,
+              "an invalid dependency name is rejected before any copy");
+    }
+    luna_mods_free_info(info, count);
+    luna_mods_destroy(mods);
+
+    /* a root that only contains rejected manifests reports why */
+    snprintf(onlyroot, sizeof(onlyroot), "%s/onlybad", bad);
+    make_raw_mod(onlyroot, "broken",
+                 "{\"name\":\"only.broken\",\"version\":\"nope\"}");
+    {
+        LunaMods *only = luna_mods_create(ctx);
+        LunaModInfo *oi = NULL;
+        size_t oc = 0;
+
+        roots[0] = onlyroot;
+        rc = luna_mods_load(only, roots, 1, NULL, antimod(NULL), &oi, &oc,
+                            err, sizeof(err));
+        check(rc != 0 && strstr(err, "invalid manifest") != NULL &&
+              strstr(err, "onlybad") != NULL,
+              "an all-invalid root names the rejected manifest");
+        if (rc == 0)
+            luna_mods_free_info(oi, oc);
+        luna_mods_destroy(only);
+    }
+
+    /* a valid manifest with no entrypoint fails as a mod, not as a scan error,
+     * and the caller may pass a zero sized top level error buffer */
+    {
+        LunaMods *missing = luna_mods_create(ctx);
+        LunaModInfo *mi = NULL;
+        size_t mc = 0;
+
+        snprintf(onlyroot, sizeof(onlyroot), "%s/missingroot", bad);
+        make_raw_mod(onlyroot, "missing",
+                     "{\"name\":\"mod.missing\",\"version\":\"1.0.0-beta\"}");
+        roots[0] = onlyroot;
+        rc = luna_mods_load(missing, roots, 1, NULL, antimod(NULL), &mi, &mc,
+                            NULL, 0);
+        check(rc == 0 && mc == 1, "missing entrypoint is a load failure, not a scan failure");
+        if (rc == 0) {
+            check(mi[0].failed && mi[0].error &&
+                  strstr(mi[0].error, "cannot read") != NULL,
+                  "missing entrypoint is reported with its path");
+            luna_mods_free_info(mi, mc);
+        }
+        luna_mods_destroy(missing);
+    }
 }
 
 int main(void)
@@ -525,6 +703,9 @@ int main(void)
     /* requirement aware resolution, conflicts, load order, cycles */
     run_dependency_scenarios(ctx, base);
 
+    /* rejected manifests are visible and cannot escape their package dir */
+    run_manifest_validation(ctx, base);
+
     /* version helpers */
     check(luna_version_cmp("1.2.3", "1.2.4") < 0, "1.2.3 < 1.2.4");
     check(luna_version_cmp("1.10.0", "1.9.9") > 0, "1.10.0 > 1.9.9");
@@ -558,6 +739,50 @@ int main(void)
     check(luna_version_matches("4.5.6", "*") == 1, "* matches anything");
     check(luna_version_matches("1.2.5", "1.2") == 1, "partial spec accepts patch siblings");
     check(luna_version_matches("1.3.0", "1.2") == 0, "partial spec rejects the next minor");
+    check(luna_version_matches("1.2.3", "1.2.3junk") == 0,
+          "trailing text in a requirement is rejected");
+    check(luna_version_matches("1.2.3", "1.x.5") == 0,
+          "components after a wildcard are rejected");
+    check(luna_version_matches("1.2.3", "1.2.3 ||") == 0,
+          "an empty alternative is rejected");
+    check(luna_version_matches("1.2.3", "   ") == 0,
+          "a whitespace only requirement matches nothing");
+    check(luna_version_matches("1.2.3", "1.") == 0,
+          "a trailing dot is rejected");
+    check(luna_version_matches("1.0.0", "=*") == 1,
+          "a wildcard with an operator means any");
+    check(luna_version_matches("999999999.0.0", "99999999999999999999") == 0,
+          "out of range numeric components do not match");
+    check(luna_version_cmp("99999999999999999999", "1.0.0") > 0,
+          "comparison saturates instead of overflowing");
+    check(luna_version_cmp("1.0.0-beta", "1.0.0") < 0,
+          "a prerelease sorts below its release");
+    check(luna_version_cmp("1.0.0-alpha", "1.0.0-beta") < 0,
+          "prerelease identifiers order lexically");
+    check(luna_version_cmp("1.0.0-beta.2", "1.0.0-beta.11") < 0,
+          "numeric prerelease identifiers compare numerically");
+    check(luna_version_cmp("1.0.0-beta", "1.0.0-beta.2") < 0,
+          "a shorter prerelease identifier list sorts first");
+    check(luna_version_cmp("1.0.0-beta.2", "1.0.0-rc.1") < 0,
+          "numeric prerelease identifiers sort before alphanumeric ones");
+    check(luna_version_cmp("1.0.0+build.2", "1.0.0") == 0,
+          "build metadata does not affect ordering");
+    check(luna_version_matches("1.2.3-rc.1", "=1.2.3-rc.1") == 1,
+          "an exact prerelease requirement matches");
+    check(luna_version_matches("1.2.3", "=1.2.3-rc.1") == 0,
+          "a release does not satisfy an exact prerelease");
+    check(luna_version_matches("1.2.3-rc.1", "^1.2.3-beta") == 1,
+          "caret from a prerelease accepts the same core prerelease");
+    check(luna_version_matches("1.2.4-beta", "^1.2.3-beta") == 0,
+          "caret from a prerelease rejects other core prereleases");
+    check(luna_version_matches("1.2.4", "^1.2.3-beta") == 1,
+          "caret from a prerelease accepts later releases");
+    check(luna_version_matches("1.5.0-beta", ">=1.0.0") == 0,
+          "a release comparator rejects prereleases by default");
+    check(luna_version_matches("1.5.0-beta", "*") == 1,
+          "* opts into prereleases");
+    check(luna_version_matches("1.5.0-beta", NULL) == 1,
+          "a bare dependency accepts an installed prerelease");
 
     /* wrong anti-mod data makes every container fail to load */
     {

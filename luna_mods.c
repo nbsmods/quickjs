@@ -1,10 +1,10 @@
 /*
  * Luna mod loader.
  *
- * Discovers mod packages on disk, picks the newest copy of each one, copies
- * read only (APK asset) copies into the app data directory when needed,
- * resolves the dependency graph declared by manifest.json and evaluates the
- * entrypoint bytecode of every mod in dependency order.
+ * Discovers mod packages on disk, chooses one loadable copy per package,
+ * copies read only (APK asset) copies into the app data directory when
+ * needed, resolves the dependency graph declared by manifest.json and
+ * evaluates the entrypoint bytecode of every mod in dependency order.
  *
  * Every mod is an ES module, so "exports" are the module exports object and
  * mods consume each other with plain import statements. The registry is also
@@ -13,7 +13,8 @@
  *
  * manifest.json fields:
  *   name          package name, required, e.g. "com.luna.mods.aim"
- *   version       dotted numeric version, required, e.g. "1.4.2"
+ *   version       dotted numeric version with optional -prerelease, required,
+ *                 e.g. "1.4.2" or "2.0.0-beta.3"
  *   author        free form
  *   dependencies  array of "name" or "name@range" strings, required deps
  *   optionalDependencies  same shape; soft links, never fail a mod
@@ -41,6 +42,11 @@
  *   ^1.2.3        [1.2.3, 2.0.0)   leftmost non zero component
  *   ^0.2.3        [0.2.3, 0.3.0)
  *   ^0.0.3        [0.0.3, 0.0.4)
+ *
+ * A version may carry a semver prerelease ("1.2.3-beta.2"); a release sorts
+ * above its prereleases. A range only opts into prereleases through a bound
+ * that names one for the same core ("^1.2.3-beta" accepts "1.2.3-rc") or
+ * when the dependency omits a range or uses "*" ("any installed copy").
  */
 #include "luna_mods.h"
 #include "quickjs.h"
@@ -56,21 +62,38 @@
 #include <sys/ptrace.h>
 
 /* ------------------------------------------------------------------ */
+/* limits and names                                                    */
+/* ------------------------------------------------------------------ */
+
+#define LUNA_MANIFEST_MAX      (1024 * 1024)            /* 1 MiB */
+#define LUNA_ENTRY_MAX         (256u * 1024 * 1024)     /* 256 MiB */
+#define LUNA_MOD_NAME_MAX      127
+#define LUNA_MOD_VERSION_MAX   63
+#define LUNA_MOD_PATH_MAX      255
+#define LUNA_MOD_DEP_MAX       255
+#define LUNA_MOD_LIST_MAX      64
+#define LUNA_SCAN_ISSUE_MAX    256
+#define LUNA_VERSION_COMP_MAX  999999999
+
+/* ------------------------------------------------------------------ */
 /* file helpers                                                        */
 /* ------------------------------------------------------------------ */
 
-/* bounded copy that always NUL terminates */
+/* bounded copy that always NUL terminates, including the cap == 0 case */
 static void luna_copy_str(char *dst, size_t cap, const char *src)
 {
-    size_t n = strlen(src);
+    size_t n;
 
+    if (!dst || cap == 0)
+        return;
+    n = strlen(src);
     if (n >= cap)
         n = cap - 1;
     memcpy(dst, src, n);
     dst[n] = '\0';
 }
 
-static char *luna_read_file(const char *path, size_t *len)
+static char *luna_read_file(const char *path, size_t max_size, size_t *len)
 {
     FILE *f = fopen(path, "rb");
     char *buf;
@@ -83,7 +106,9 @@ static char *luna_read_file(const char *path, size_t *len)
         return NULL;
     }
     size = ftell(f);
-    if (size < 0 || fseek(f, 0, SEEK_SET) != 0) {
+    if (size < 0 ||
+        (max_size != 0 && (unsigned long long)size > (unsigned long long)max_size) ||
+        fseek(f, 0, SEEK_SET) != 0) {
         fclose(f);
         return NULL;
     }
@@ -151,6 +176,86 @@ static int luna_join(char *out, size_t cap, const char *a, const char *b)
     return (n > 0 && (size_t)n < cap) ? 0 : -1;
 }
 
+/* Package names double as path components (materialization) and module
+ * specifiers, so keep them to a conservative, path safe set. */
+static int luna_name_syntax_valid(const char *name)
+{
+    size_t i, n;
+
+    if (!name)
+        return 0;
+    n = strlen(name);
+    if (n == 0 || n > LUNA_MOD_NAME_MAX)
+        return 0;
+    if (name[0] == '.')
+        return 0;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)name[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+              c == '-' || c == '+'))
+            return 0;
+    }
+    return 1;
+}
+
+/* "luna" is the synthetic loader API package, so a real package may not
+ * shadow it. Dependency names still use the syntax check above. */
+static int luna_package_name_valid(const char *name)
+{
+    return luna_name_syntax_valid(name) &&
+           strcmp(name, LUNA_MODS_API_NAME) != 0;
+}
+
+/* Relative file names used by the manifest must not escape the package
+ * directory: reject absolute paths, backslashes, empty segments and any
+ * "." or ".." component. */
+static int luna_path_relative_valid(const char *path)
+{
+    size_t n;
+
+    if (!path || !*path)
+        return 0;
+    n = strlen(path);
+    if (n > LUNA_MOD_PATH_MAX || path[0] == '/' || path[0] == '\\')
+        return 0;
+    while (*path) {
+        const char *segment = path;
+        size_t len;
+
+        while (*path && *path != '/') {
+            unsigned char c = (unsigned char)*path;
+
+            if (c == '\\' || c < 0x20)
+                return 0;
+            path++;
+        }
+        len = (size_t)(path - segment);
+        if (len == 0)
+            return 0;       /* "//" or a trailing slash */
+        if ((len == 1 && segment[0] == '.') ||
+            (len == 2 && segment[0] == '.' && segment[1] == '.'))
+            return 0;
+        if (*path == '/')
+            path++;
+    }
+    return 1;
+}
+
+/* Split "com.example.core@^1.2.0" into name and spec. */
+static void luna_split_dep(const char *dep, char *name, size_t name_cap, const char **spec)
+{
+    const char *at = strchr(dep, '@');
+    size_t n = at ? (size_t)(at - dep) : strlen(dep);
+
+    if (n >= name_cap)
+        n = name_cap - 1;
+    memcpy(name, dep, n);
+    name[n] = '\0';
+    *spec = at ? at + 1 : NULL;
+}
+
 static int luna_copy_tree(const char *src, const char *dst)
 {
     DIR *d;
@@ -173,7 +278,9 @@ static int luna_copy_tree(const char *src, const char *dst)
             continue;
         if (luna_join(dpath, sizeof(dpath), dst, de->d_name) != 0)
             continue;
-        if (stat(spath, &st) != 0)
+        /* do not follow symlinks: a package must not be able to pull an
+         * arbitrary host tree into the writable mod directory */
+        if (lstat(spath, &st) != 0 || S_ISLNK(st.st_mode))
             continue;
         if (S_ISDIR(st.st_mode)) {
             if (luna_copy_tree(spath, dpath) != 0) {
@@ -182,7 +289,7 @@ static int luna_copy_tree(const char *src, const char *dst)
             }
         } else {
             size_t len;
-            char *data = luna_read_file(spath, &len);
+            char *data = luna_read_file(spath, 0, &len);
             FILE *out;
 
             if (!data)
@@ -248,33 +355,93 @@ static void luna_manifest_clear(LunaManifest *m)
     memset(m, 0, sizeof(*m));
 }
 
+/* Turn the pending JS exception into a one line manifest error and clear it,
+ * so a broken manifest cannot leak a pending exception into the host. */
+static void luna_js_error(JSContext *ctx, char *out, size_t cap)
+{
+    JSValue exc = JS_GetException(ctx);
+    const char *s = JS_ToCString(ctx, exc);
+
+    if (s) {
+        snprintf(out, cap, "%s", s);
+        JS_FreeCString(ctx, s);
+    } else {
+        snprintf(out, cap, "invalid JSON");
+        JS_GetException(ctx);   /* clear a secondary conversion failure */
+    }
+    JS_FreeValue(ctx, exc);
+}
+
 /* Read a string field out of an already parsed manifest object. */
 static int luna_manifest_str(JSContext *ctx, JSValueConst obj, const char *field,
-                             char *out, size_t out_cap)
+                             char *out, size_t out_cap, int required,
+                             char *err, size_t err_cap)
 {
     JSValue v = JS_GetPropertyStr(ctx, obj, field);
     const char *s;
+    size_t len;
     int rc = -1;
 
     out[0] = '\0';
-    if (JS_IsException(v))
+    if (JS_IsException(v)) {
+        snprintf(err, err_cap, "cannot read field '%s'", field);
+        luna_js_error(ctx, err, err_cap);
         return -1;
+    }
     if (JS_IsUndefined(v) || JS_IsNull(v)) {
         JS_FreeValue(ctx, v);
+        if (required) {
+            snprintf(err, err_cap, "missing field '%s'", field);
+            return -1;
+        }
         return 0;
     }
-    s = JS_ToCString(ctx, v);
-    if (s) {
-        snprintf(out, out_cap, "%s", s);
-        JS_FreeCString(ctx, s);
-        rc = 0;
+    if (!JS_IsString(v)) {
+        snprintf(err, err_cap, "field '%s' must be a string", field);
+        goto done;
     }
+    s = JS_ToCStringLen(ctx, &len, v);
+    if (!s) {
+        snprintf(err, err_cap, "cannot read field '%s'", field);
+        luna_js_error(ctx, err, err_cap);
+        goto done;
+    }
+    if (strlen(s) != len) {
+        snprintf(err, err_cap, "field '%s' contains a NUL byte", field);
+        JS_FreeCString(ctx, s);
+        goto done;
+    }
+    if (len >= out_cap) {
+        snprintf(err, err_cap, "field '%s' is too long (max %zu bytes)", field, out_cap - 1);
+        JS_FreeCString(ctx, s);
+        goto done;
+    }
+    if (required && len == 0) {
+        snprintf(err, err_cap, "field '%s' must not be empty", field);
+        JS_FreeCString(ctx, s);
+        goto done;
+    }
+    memcpy(out, s, len + 1);
+    JS_FreeCString(ctx, s);
+    rc = 0;
+
+ done:
     JS_FreeValue(ctx, v);
     return rc;
 }
 
+static void luna_free_list(char **items, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++)
+        free(items[i]);
+    free(items);
+}
+
 static int luna_manifest_list(JSContext *ctx, JSValueConst obj, const char *field,
-                              char ***out, size_t *out_count)
+                              char ***out, size_t *out_count,
+                              char *err, size_t err_cap)
 {
     JSValue arr = JS_GetPropertyStr(ctx, obj, field);
     JSValue len;
@@ -284,114 +451,167 @@ static int luna_manifest_list(JSContext *ctx, JSValueConst obj, const char *fiel
 
     *out = NULL;
     *out_count = 0;
-    if (JS_IsException(arr))
+    if (JS_IsException(arr)) {
+        snprintf(err, err_cap, "cannot read field '%s'", field);
+        luna_js_error(ctx, err, err_cap);
         return -1;
-    if (JS_IsUndefined(arr)) {
+    }
+    if (JS_IsUndefined(arr) || JS_IsNull(arr)) {
         JS_FreeValue(ctx, arr);
         return 0;
     }
-    len = JS_GetPropertyStr(ctx, arr, "length");
-    if (JS_IsException(len)) {
+    if (!JS_IsArray(ctx, arr)) {
+        snprintf(err, err_cap, "field '%s' must be an array", field);
         JS_FreeValue(ctx, arr);
         return -1;
     }
-    if (JS_ToInt32(ctx, &n, len) != 0 || n < 0)
-        n = 0;
+    len = JS_GetPropertyStr(ctx, arr, "length");
+    if (JS_IsException(len) || JS_ToInt32(ctx, &n, len) != 0 || n < 0) {
+        snprintf(err, err_cap, "field '%s' has an invalid length", field);
+        JS_FreeValue(ctx, len);
+        JS_FreeValue(ctx, arr);
+        return -1;
+    }
     JS_FreeValue(ctx, len);
+    if (n > LUNA_MOD_LIST_MAX) {
+        snprintf(err, err_cap, "field '%s' has too many entries (max %d)",
+                 field, LUNA_MOD_LIST_MAX);
+        JS_FreeValue(ctx, arr);
+        return -1;
+    }
     for (i = 0; i < n; i++) {
         JSValue item = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
-        const char *s = JS_ToCString(ctx, item);
+        const char *s;
+        size_t slen;
         char **grown;
+        char *copy;
 
-        if (s && *s) {
-            grown = (char **)realloc(items, (count + 1) * sizeof(char *));
-            if (grown) {
-                items = grown;
-                items[count++] = strdup(s);
-            }
+        if (JS_IsException(item)) {
+            snprintf(err, err_cap, "cannot read entry %d of '%s'", i, field);
+            luna_js_error(ctx, err, err_cap);
+            goto fail;
         }
-        if (s)
+        if (!JS_IsString(item)) {
+            snprintf(err, err_cap, "entry %d of '%s' must be a string", i, field);
+            JS_FreeValue(ctx, item);
+            goto fail;
+        }
+        s = JS_ToCStringLen(ctx, &slen, item);
+        if (!s) {
+            snprintf(err, err_cap, "cannot read entry %d of '%s'", i, field);
+            luna_js_error(ctx, err, err_cap);
+            JS_FreeValue(ctx, item);
+            goto fail;
+        }
+        if (slen == 0 || slen > LUNA_MOD_DEP_MAX || strlen(s) != slen) {
+            snprintf(err, err_cap, "entry %d of '%s' has an invalid length", i, field);
             JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, item);
+            goto fail;
+        }
+        copy = strdup(s);
+        JS_FreeCString(ctx, s);
         JS_FreeValue(ctx, item);
+        if (!copy) {
+            snprintf(err, err_cap, "out of memory");
+            goto fail;
+        }
+        grown = (char **)realloc(items, (count + 1) * sizeof(char *));
+        if (!grown) {
+            free(copy);
+            snprintf(err, err_cap, "out of memory");
+            goto fail;
+        }
+        items = grown;
+        items[count++] = copy;
     }
     JS_FreeValue(ctx, arr);
     *out = items;
     *out_count = count;
     return 0;
+
+ fail:
+    JS_FreeValue(ctx, arr);
+    luna_free_list(items, count);
+    return -1;
 }
 
-static int luna_manifest_load(JSContext *ctx, const char *dir, LunaManifest *m)
+static int luna_manifest_load(JSContext *ctx, const char *dir, LunaManifest *m,
+                              char *err, size_t err_cap)
 {
     char path[1024], *json;
     size_t len;
-    JSValue obj, parsed, text;
+    JSValue parsed;
     int rc = -1;
 
     memset(m, 0, sizeof(*m));
-    m->dep_count = 0;
     snprintf(m->entry, sizeof(m->entry), "main.luna");
 
-    if (luna_join(path, sizeof(path), dir, LUNA_MODS_MANIFEST) != 0)
+    if (luna_join(path, sizeof(path), dir, LUNA_MODS_MANIFEST) != 0) {
+        snprintf(err, err_cap, "manifest path is too long");
         return -1;
-    json = luna_read_file(path, &len);
-    if (!json)
+    }
+    json = luna_read_file(path, LUNA_MANIFEST_MAX, &len);
+    if (!json) {
+        snprintf(err, err_cap, "cannot read manifest.json (missing or larger than %d bytes)",
+                 LUNA_MANIFEST_MAX);
         return -1;
-
-    /* the engine already ships a JSON parser, so use it instead of growing a
-     * second one: JSON.parse(manifest_source) */
-    text = JS_NewStringLen(ctx, json, len);
+    }
+    /* use the engine parser directly: no dependence on a possibly patched
+     * global JSON.parse and no JS call overhead per manifest */
+    parsed = JS_ParseJSON(ctx, json, len, path);
     free(json);
-    if (JS_IsException(text))
+    if (JS_IsException(parsed)) {
+        luna_js_error(ctx, err, err_cap);
         return -1;
-    {
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
-
-        JS_FreeValue(ctx, global);
-        if (JS_IsException(json_obj)) {
-            JS_FreeValue(ctx, text);
-            return -1;
-        }
-        obj = JS_GetPropertyStr(ctx, json_obj, "parse");
-        JS_FreeValue(ctx, json_obj);
-        if (JS_IsException(obj)) {
-            JS_FreeValue(ctx, text);
-            return -1;
-        }
-        parsed = JS_Call(ctx, obj, JS_UNDEFINED, 1, &text);
-        JS_FreeValue(ctx, obj);
-        JS_FreeValue(ctx, text);
-        if (JS_IsException(parsed))
-            return -1;
+    }
+    if (!JS_IsObject(parsed)) {
+        snprintf(err, err_cap, "manifest.json must contain a JSON object");
+        goto done;
     }
 
-    if (luna_manifest_str(ctx, parsed, "name", m->name, sizeof(m->name)) != 0 || !m->name[0])
+    if (luna_manifest_str(ctx, parsed, "name", m->name, sizeof(m->name), 1,
+                          err, err_cap) != 0)
         goto done;
-    if (luna_manifest_str(ctx, parsed, "version", m->version, sizeof(m->version)) != 0 || !m->version[0])
+    if (luna_manifest_str(ctx, parsed, "version", m->version, sizeof(m->version), 1,
+                          err, err_cap) != 0)
         goto done;
-    if (luna_manifest_str(ctx, parsed, "author", m->author, sizeof(m->author)) != 0)
-        m->author[0] = '\0';
-    if (luna_manifest_str(ctx, parsed, "icon", m->icon, sizeof(m->icon)) != 0)
-        m->icon[0] = '\0';
-    if (luna_manifest_str(ctx, parsed, "entrypoint", m->entry, sizeof(m->entry)) != 0 || !m->entry[0])
+    if (luna_manifest_str(ctx, parsed, "author", m->author, sizeof(m->author), 0,
+                          err, err_cap) != 0)
+        goto done;
+    if (luna_manifest_str(ctx, parsed, "icon", m->icon, sizeof(m->icon), 0,
+                          err, err_cap) != 0)
+        goto done;
+    if (luna_manifest_str(ctx, parsed, "entrypoint", m->entry, sizeof(m->entry), 0,
+                          err, err_cap) != 0)
+        goto done;
+    if (!m->entry[0])
         snprintf(m->entry, sizeof(m->entry), "main.luna");
-    if (luna_manifest_list(ctx, parsed, "dependencies", &m->deps, &m->dep_count) != 0)
+    if (luna_manifest_list(ctx, parsed, "dependencies", &m->deps, &m->dep_count,
+                           err, err_cap) != 0)
         goto done;
-    if (luna_manifest_list(ctx, parsed, "optionalDependencies", &m->opt_deps, &m->opt_dep_count) != 0)
+    if (luna_manifest_list(ctx, parsed, "optionalDependencies", &m->opt_deps,
+                           &m->opt_dep_count, err, err_cap) != 0)
         goto done;
-    if (luna_manifest_list(ctx, parsed, "conflicts", &m->conflicts, &m->conflict_count) != 0)
+    if (luna_manifest_list(ctx, parsed, "conflicts", &m->conflicts,
+                           &m->conflict_count, err, err_cap) != 0)
         goto done;
     if (m->conflict_count == 0 &&
-        luna_manifest_list(ctx, parsed, "breaks", &m->conflicts, &m->conflict_count) != 0)
+        luna_manifest_list(ctx, parsed, "breaks", &m->conflicts,
+                           &m->conflict_count, err, err_cap) != 0)
         goto done;
-    if (luna_manifest_list(ctx, parsed, "loadBefore", &m->before, &m->before_count) != 0)
+    if (luna_manifest_list(ctx, parsed, "loadBefore", &m->before, &m->before_count,
+                           err, err_cap) != 0)
         goto done;
-    if (luna_manifest_list(ctx, parsed, "loadAfter", &m->after, &m->after_count) != 0)
+    if (luna_manifest_list(ctx, parsed, "loadAfter", &m->after, &m->after_count,
+                           err, err_cap) != 0)
         goto done;
     rc = 0;
 
  done:
     JS_FreeValue(ctx, parsed);
+    if (rc != 0)
+        luna_manifest_clear(m);
     return rc;
 }
 
@@ -400,19 +620,30 @@ static int luna_manifest_load(JSContext *ctx, const char *dir, LunaManifest *m)
 /* ------------------------------------------------------------------ */
 
 /*
- * Versions are dotted numeric ("1.4.2"); missing components count as zero,
- * so "1.2" equals "1.2.0". A requirement is a set of alternatives separated
- * by "||"; each alternative is a set of whitespace separated terms that must
- * all match. See the file header for the grammar.
+ * Versions are one to four dotted numeric components ("1.4.2"), optionally
+ * followed by a semver style prerelease ("1.0.0-beta.2") and build metadata
+ * ("+build.7", ignored for ordering). Missing components count as zero, so
+ * "1.2" equals "1.2.0". A release sorts above its prereleases. A requirement
+ * is a set of alternatives separated by "||"; each alternative is a set of
+ * whitespace separated terms that must all match. See the file header for the
+ * grammar.
  */
+
+typedef struct LunaVersion {
+    int comp[4];
+    int count;
+    char pre[32];       /* empty for a release */
+} LunaVersion;
 
 typedef struct LunaRange {
     int has_lower;
-    char lower[64];
+    char lower[96];
     int lower_inclusive;
     int has_upper;
-    char upper[64];
+    char upper[96];
     int upper_inclusive;
+    /* set by a bare "*"/empty requirement: prereleases are eligible too */
+    int allow_prerelease;
 } LunaRange;
 
 #define LUNA_REQ_MAX_ALTERNATIVES 4
@@ -423,14 +654,21 @@ typedef struct LunaRequirement {
     int valid;
 } LunaRequirement;
 
-/* Parse one numeric component; sets *next to NULL when the version ends. */
+/* Parse one numeric component; sets *next to NULL when the version ends.
+ * Values saturate at LUNA_VERSION_COMP_MAX so hostile input in the loose
+ * fallback path cannot overflow. */
 static int luna_dot_num(const char *s, const char **next)
 {
     int v = 0;
     int digits = 0;
 
     while (*s >= '0' && *s <= '9') {
-        v = v * 10 + (*s++ - '0');
+        int digit = *s++ - '0';
+
+        if (v > (LUNA_VERSION_COMP_MAX - digit) / 10)
+            v = LUNA_VERSION_COMP_MAX;
+        else
+            v = v * 10 + digit;
         digits = 1;
     }
     if (digits && *s == '.')
@@ -440,60 +678,215 @@ static int luna_dot_num(const char *s, const char **next)
     return v;
 }
 
-int luna_version_cmp(const char *a, const char *b)
+static int luna_pre_ident_is_numeric(const char *s, size_t len)
 {
-    const char *pa = a, *pb = b;
+    size_t i;
 
-    for (;;) {
-        int va = pa ? luna_dot_num(pa, &pa) : 0;
-        int vb = pb ? luna_dot_num(pb, &pb) : 0;
-
-        if (va != vb)
-            return va < vb ? -1 : 1;
-        if (!pa && !pb)
+    if (len == 0)
+        return 0;
+    for (i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9')
             return 0;
+    }
+    return 1;
+}
+
+/* Semver prerelease ordering: numeric identifiers compare numerically and
+ * sort before alphanumeric ones; a shorter list sorts first when otherwise
+ * equal. */
+static int luna_pre_cmp(const char *a, const char *b)
+{
+    for (;;) {
+        const char *ea = strchr(a, '.');
+        const char *eb = strchr(b, '.');
+        size_t la = ea ? (size_t)(ea - a) : strlen(a);
+        size_t lb = eb ? (size_t)(eb - b) : strlen(b);
+        int na = luna_pre_ident_is_numeric(a, la);
+        int nb = luna_pre_ident_is_numeric(b, lb);
+        int c;
+
+        if (na && nb) {
+            while (la > 1 && *a == '0') {
+                a++;
+                la--;
+            }
+            while (lb > 1 && *b == '0') {
+                b++;
+                lb--;
+            }
+            if (la != lb)
+                return la < lb ? -1 : 1;
+            c = memcmp(a, b, la);
+            if (c != 0)
+                return c < 0 ? -1 : 1;
+        } else if (na != nb) {
+            return na ? -1 : 1;
+        } else {
+            size_t n = la < lb ? la : lb;
+
+            c = memcmp(a, b, n);
+            if (c != 0)
+                return c < 0 ? -1 : 1;
+            if (la != lb)
+                return la < lb ? -1 : 1;
+        }
+        if (!ea && !eb)
+            return 0;
+        if (!ea)
+            return -1;
+        if (!eb)
+            return 1;
+        a = ea + 1;
+        b = eb + 1;
     }
 }
 
-/* Parse up to four numeric components; -*wildcard is the first wildcard
- * component index ("1.x" -> 1), or -1 when there is none. Trailing text
- * that is not dotted numeric ends the version. */
-static int luna_version_parse(const char *s, int comp[4], int *count, int *wildcard)
+/* Strict parser for a version or a range operand. When wildcard is non-NULL
+ * an x, X or * component is allowed as the final component and its index is
+ * returned; wildcard ranges cannot have a prerelease. Build metadata is
+ * validated and ignored. Returns 0 on success. */
+static int luna_version_parse_full(const char *s, LunaVersion *v, int *wildcard)
 {
     int n = 0;
-    int i = 0;
 
-    comp[0] = comp[1] = comp[2] = comp[3] = 0;
-    *count = 0;
-    *wildcard = -1;
-    while (s[i] != '\0') {
-        int v;
+    memset(v, 0, sizeof(*v));
+    if (wildcard)
+        *wildcard = -1;
+    if (!s || !*s)
+        return -1;
+    for (;;) {
+        int value = 0;
+        int digits = 0;
+        int digit;
 
-        if (s[i] == 'x' || s[i] == 'X' || s[i] == '*') {
+        if (*s == 'x' || *s == 'X' || *s == '*') {
+            if (!wildcard)
+                return -1;
             *wildcard = n;
-            break;
+            v->count = n;
+            s++;
+            return (*s == '\0') ? 0 : -1;
         }
-        if (s[i] < '0' || s[i] > '9')
+        if (*s < '0' || *s > '9' || n >= 4)
             return -1;
-        if (n >= 4)
-            break;
-        v = 0;
-        while (s[i] >= '0' && s[i] <= '9')
-            v = v * 10 + (s[i++] - '0');
-        comp[n++] = v;
-        if (s[i] == '.') {
-            i++;
-            continue;
+        while (*s >= '0' && *s <= '9') {
+            digit = *s - '0';
+            if (value > (LUNA_VERSION_COMP_MAX - digit) / 10)
+                return -1;
+            value = value * 10 + digit;
+            digits = 1;
+            s++;
         }
-        break;
+        if (!digits)
+            return -1;
+        v->comp[n++] = value;
+        if (*s == '\0')
+            break;
+        if (*s != '.')
+            break;      /* prerelease or build metadata follows */
+        s++;
+        if (*s == '\0')
+            return -1;
     }
-    *count = n;
-    return 0;
+    v->count = n;
+    if (*s == '-') {
+        const char *start;
+        size_t len = 0;
+
+        s++;
+        start = s;
+        while (*s && *s != '+') {
+            unsigned char c = (unsigned char)*s;
+
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z') || c == '-' || c == '.'))
+                return -1;
+            if (c == '.' &&
+                (s == start || s[-1] == '.' || s[1] == '\0' || s[1] == '+'))
+                return -1;
+            len++;
+            if (len >= sizeof(v->pre))
+                return -1;
+            s++;
+        }
+        if (len == 0)
+            return -1;
+        memcpy(v->pre, start, len);
+        v->pre[len] = '\0';
+    }
+    if (*s == '+') {
+        s++;
+        if (!*s)
+            return -1;
+        while (*s) {
+            unsigned char c = (unsigned char)*s++;
+
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z') || c == '-' || c == '.'))
+                return -1;
+        }
+    }
+    return (*s == '\0') ? 0 : -1;
+}
+
+int luna_version_cmp(const char *a, const char *b)
+{
+    LunaVersion va, vb;
+    int i;
+
+    if (luna_version_parse_full(a, &va, NULL) == 0 &&
+        luna_version_parse_full(b, &vb, NULL) == 0) {
+        for (i = 0; i < 4; i++) {
+            if (va.comp[i] != vb.comp[i])
+                return va.comp[i] < vb.comp[i] ? -1 : 1;
+        }
+        if (!va.pre[0] && !vb.pre[0])
+            return 0;
+        if (!va.pre[0])
+            return 1;       /* a release sorts above its prereleases */
+        if (!vb.pre[0])
+            return -1;
+        return luna_pre_cmp(va.pre, vb.pre);
+    }
+
+    /* Loose fallback for non-canonical text passed by external callers. */
+    {
+        const char *pa = a, *pb = b;
+
+        for (;;) {
+            int va2 = pa ? luna_dot_num(pa, &pa) : 0;
+            int vb2 = pb ? luna_dot_num(pb, &pb) : 0;
+
+            if (va2 != vb2)
+                return va2 < vb2 ? -1 : 1;
+            if (!pa && !pb)
+                return 0;
+        }
+    }
+}
+
+static int luna_version_valid(const char *version)
+{
+    LunaVersion v;
+
+    if (!version || strlen(version) > LUNA_MOD_VERSION_MAX)
+        return 0;
+    return luna_version_parse_full(version, &v, NULL) == 0;
 }
 
 static void luna_version_format(const int comp[4], char *out, size_t cap)
 {
     snprintf(out, cap, "%d.%d.%d.%d", comp[0], comp[1], comp[2], comp[3]);
+}
+
+static void luna_version_format_pre(const LunaVersion *v, char *out, size_t cap)
+{
+    if (v->pre[0]) {
+        snprintf(out, cap, "%d.%d.%d.%d-%s", v->comp[0], v->comp[1],
+                 v->comp[2], v->comp[3], v->pre);
+    } else {
+        luna_version_format(v->comp, out, cap);
+    }
 }
 
 /* Increment component index, zero everything below it. */
@@ -511,14 +904,22 @@ static void luna_version_bump(int comp[4], int index, char *out, size_t cap)
     luna_version_format(comp, out, cap);
 }
 
-static void luna_range_any(LunaRange *r)
+/* Neutral element for intersecting terms: no bounds, no prereleases. */
+static void luna_range_all(LunaRange *r)
 {
     memset(r, 0, sizeof(*r));
 }
 
+/* A real "any": no bounds, prereleases eligible. */
+static void luna_range_any(LunaRange *r)
+{
+    memset(r, 0, sizeof(*r));
+    r->allow_prerelease = 1;
+}
+
 static void luna_range_exact(LunaRange *r, const char *version)
 {
-    luna_range_any(r);
+    luna_range_all(r);
     r->has_lower = 1;
     snprintf(r->lower, sizeof(r->lower), "%s", version);
     r->lower_inclusive = 1;
@@ -529,7 +930,7 @@ static void luna_range_exact(LunaRange *r, const char *version)
 
 static void luna_range_lower(LunaRange *r, const char *version, int inclusive)
 {
-    luna_range_any(r);
+    luna_range_all(r);
     r->has_lower = 1;
     snprintf(r->lower, sizeof(r->lower), "%s", version);
     r->lower_inclusive = inclusive;
@@ -537,7 +938,7 @@ static void luna_range_lower(LunaRange *r, const char *version, int inclusive)
 
 static void luna_range_upper(LunaRange *r, const char *version, int inclusive)
 {
-    luna_range_any(r);
+    luna_range_all(r);
     r->has_upper = 1;
     snprintf(r->upper, sizeof(r->upper), "%s", version);
     r->upper_inclusive = inclusive;
@@ -545,7 +946,7 @@ static void luna_range_upper(LunaRange *r, const char *version, int inclusive)
 
 static void luna_range_between(LunaRange *r, const char *lo, const char *hi)
 {
-    luna_range_any(r);
+    luna_range_all(r);
     r->has_lower = 1;
     snprintf(r->lower, sizeof(r->lower), "%s", lo);
     r->lower_inclusive = 1;
@@ -556,6 +957,7 @@ static void luna_range_between(LunaRange *r, const char *lo, const char *hi)
 
 static void luna_range_intersect(LunaRange *a, const LunaRange *b)
 {
+    a->allow_prerelease = a->allow_prerelease || b->allow_prerelease;
     if (b->has_lower) {
         int c;
 
@@ -592,8 +994,38 @@ static void luna_range_intersect(LunaRange *a, const LunaRange *b)
     }
 }
 
+/* A prerelease version only satisfies a range when the range opted into
+ * prereleases (bare "*"/no requirement) or one of its bounds names a
+ * prerelease with the same core. This keeps `^1.2.3` from silently accepting
+ * `2.0.0-beta`, while `^1.2.3-beta` can still select `1.2.3-rc`. */
+static int luna_bound_prerelease_matches(const char *bound, const int comp[4])
+{
+    LunaVersion v;
+
+    if (luna_version_parse_full(bound, &v, NULL) != 0 || !v.pre[0])
+        return 0;
+    return memcmp(v.comp, comp, sizeof(v.comp)) == 0;
+}
+
+static int luna_range_allows_prerelease(const LunaRange *r, const char *version)
+{
+    LunaVersion v;
+
+    if (luna_version_parse_full(version, &v, NULL) != 0 || !v.pre[0])
+        return 1;
+    if (r->allow_prerelease)
+        return 1;
+    if (r->has_lower && luna_bound_prerelease_matches(r->lower, v.comp))
+        return 1;
+    if (r->has_upper && luna_bound_prerelease_matches(r->upper, v.comp))
+        return 1;
+    return 0;
+}
+
 static int luna_range_contains(const LunaRange *r, const char *version)
 {
+    if (!luna_range_allows_prerelease(r, version))
+        return 0;
     if (r->has_lower) {
         int c = luna_version_cmp(version, r->lower);
 
@@ -627,8 +1059,9 @@ static int luna_parse_term(const char *term, LunaRange *out)
 {
     char op = 0;
     const char *v = term;
+    LunaVersion ver;
     int comp[4], count, wildcard;
-    char floor[64], ceiling[64];
+    char floor[96], ceiling[96];
 
     if (!*term || strcmp(term, "*") == 0 ||
         strcmp(term, "x") == 0 || strcmp(term, "X") == 0) {
@@ -649,9 +1082,16 @@ static int luna_parse_term(const char *term, LunaRange *out)
         op = v[0];
         v++;
     }
-    if (luna_version_parse(v, comp, &count, &wildcard) != 0)
+    if (luna_version_parse_full(v, &ver, &wildcard) != 0)
         return -1;
-    luna_version_format(comp, floor, sizeof(floor));
+    /* "=*", ">=*" and friends are just "any" */
+    if (wildcard == 0) {
+        luna_range_any(out);
+        return 0;
+    }
+    memcpy(comp, ver.comp, sizeof(comp));
+    count = ver.count;
+    luna_version_format_pre(&ver, floor, sizeof(floor));
 
     switch (op) {
     case '>':
@@ -685,9 +1125,7 @@ static int luna_parse_term(const char *term, LunaRange *out)
     }
 
     /* bare version */
-    if (wildcard == 0)
-        luna_range_any(out);
-    else if (wildcard > 0) {
+    if (wildcard > 0) {
         luna_version_bump(comp, wildcard - 1, ceiling, sizeof(ceiling));
         luna_range_between(out, floor, ceiling);
     } else if (count >= 3) {
@@ -718,7 +1156,7 @@ static void luna_parse_requirement(const char *spec, LunaRequirement *req)
         LunaRange range;
         int any_term = 0;
 
-        luna_range_any(&range);
+        luna_range_all(&range);
         while (p < end) {
             const char *start;
             char term[64];
@@ -733,8 +1171,10 @@ static void luna_parse_requirement(const char *spec, LunaRequirement *req)
             if (p == start)
                 break;
             len = (size_t)(p - start);
-            if (len >= sizeof(term))
-                len = sizeof(term) - 1;
+            if (len >= sizeof(term)) {
+                req->valid = 0;     /* do not silently truncate a term */
+                return;
+            }
             memcpy(term, start, len);
             term[len] = '\0';
             if (luna_parse_term(term, &term_range) != 0) {
@@ -744,8 +1184,11 @@ static void luna_parse_requirement(const char *spec, LunaRequirement *req)
             luna_range_intersect(&range, &term_range);
             any_term = 1;
         }
-        if (!any_term)
-            luna_range_any(&range);
+        /* "1.0 || " and whitespace-only alternatives are typos, not "any" */
+        if (!any_term) {
+            req->valid = 0;
+            return;
+        }
         if (req->count >= LUNA_REQ_MAX_ALTERNATIVES) {
             req->valid = 0;
             return;
@@ -768,6 +1211,92 @@ int luna_version_matches(const char *version, const char *spec)
     for (i = 0; i < req.count; i++) {
         if (luna_range_contains(&req.alternatives[i], version))
             return 1;
+    }
+    return 0;
+}
+
+/* Validate everything the loader will later use as a path, selector or
+ * module specifier. Runs before a copy is materialized or any bytecode is
+ * read, so an untrusted manifest cannot walk out of its package directory. */
+static int luna_dep_spec_valid(const char *dep, char *err, size_t err_cap)
+{
+    char name[256];
+    const char *spec;
+    LunaRequirement req;
+
+    luna_split_dep(dep, name, sizeof(name), &spec);
+    if (!luna_name_syntax_valid(name)) {
+        snprintf(err, err_cap, "invalid dependency name '%s'", name);
+        return -1;
+    }
+    if (spec) {
+        if (!*spec) {
+            snprintf(err, err_cap, "empty requirement for dependency '%s'", name);
+            return -1;
+        }
+        luna_parse_requirement(spec, &req);
+        if (!req.valid) {
+            snprintf(err, err_cap, "invalid requirement '%s' for dependency '%s'",
+                     spec, name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int luna_manifest_validate(const LunaManifest *m, char *err, size_t err_cap)
+{
+    size_t i;
+
+    if (strcmp(m->name, LUNA_MODS_API_NAME) == 0) {
+        snprintf(err, err_cap, "package name 'luna' is reserved for the loader API");
+        return -1;
+    }
+    if (!luna_package_name_valid(m->name)) {
+        snprintf(err, err_cap,
+                 "invalid package name '%s' (allowed: letters, digits, '.', '_', '-', '+'; max %d)",
+                 m->name, LUNA_MOD_NAME_MAX);
+        return -1;
+    }
+    if (!luna_version_valid(m->version)) {
+        snprintf(err, err_cap,
+                 "invalid version '%s' (expected one to four dotted numeric components, optionally -prerelease)",
+                 m->version);
+        return -1;
+    }
+    if (!luna_path_relative_valid(m->entry)) {
+        snprintf(err, err_cap, "invalid entrypoint path '%s' (must stay inside the package)",
+                 m->entry);
+        return -1;
+    }
+    if (m->icon[0] && !luna_path_relative_valid(m->icon)) {
+        snprintf(err, err_cap, "invalid icon path '%s' (must stay inside the package)",
+                 m->icon);
+        return -1;
+    }
+    for (i = 0; i < m->dep_count; i++) {
+        if (luna_dep_spec_valid(m->deps[i], err, err_cap) != 0)
+            return -1;
+    }
+    for (i = 0; i < m->opt_dep_count; i++) {
+        if (luna_dep_spec_valid(m->opt_deps[i], err, err_cap) != 0)
+            return -1;
+    }
+    for (i = 0; i < m->conflict_count; i++) {
+        if (luna_dep_spec_valid(m->conflicts[i], err, err_cap) != 0)
+            return -1;
+    }
+    for (i = 0; i < m->before_count; i++) {
+        if (!luna_name_syntax_valid(m->before[i])) {
+            snprintf(err, err_cap, "invalid loadBefore package name '%s'", m->before[i]);
+            return -1;
+        }
+    }
+    for (i = 0; i < m->after_count; i++) {
+        if (!luna_name_syntax_valid(m->after[i])) {
+            snprintf(err, err_cap, "invalid loadAfter package name '%s'", m->after[i]);
+            return -1;
+        }
     }
     return 0;
 }
@@ -817,6 +1346,10 @@ void luna_mods_destroy(LunaMods *m)
 
     if (!m)
         return;
+    /* Opaque points at m, so put the previous hooks back before m goes away;
+     * a later import must not call into a destroyed loader. */
+    if (m->hooks_installed)
+        JS_SetModuleLoaderFunc(m->rt, m->prev_normalize, m->prev_load, m->prev_opaque);
     for (i = 0; i < m->count; i++) {
         free(m->mods[i].name);
         free(m->mods[i].dir);
@@ -917,6 +1450,13 @@ void luna_mods_free_info(LunaModInfo *info, size_t count)
         free(info[i].dir);
         free(info[i].root);
         free(info[i].error);
+        if (info[i].warnings) {
+            size_t w;
+
+            for (w = 0; w < info[i].warning_count; w++)
+                free(info[i].warnings[w]);
+            free(info[i].warnings);
+        }
     }
     free(info);
 }
@@ -967,11 +1507,13 @@ static JSValue luna_read_mod_entry(LunaMods *m, LunaLoadedMod *mod, char *err, s
         snprintf(err, err_cap, "invalid entrypoint path for %s", mod->name);
         return JS_EXCEPTION;
     }
-    buf = (uint8_t *)luna_read_file(path, &len);
+    buf = (uint8_t *)luna_read_file(path, LUNA_ENTRY_MAX, &len);
     if (!buf) {
-        luna_copy_str(err, err_cap, "cannot read ");
-        {
-            size_t used = strlen(err);
+        if (err && err_cap) {
+            size_t used;
+
+            luna_copy_str(err, err_cap, "cannot read ");
+            used = strlen(err);
             luna_copy_str(err + used, err_cap > used ? err_cap - used : 0, path);
         }
         return JS_EXCEPTION;
@@ -979,11 +1521,14 @@ static JSValue luna_read_mod_entry(LunaMods *m, LunaLoadedMod *mod, char *err, s
     obj = JS_ReadObjectLuna(m->ctx, buf, len, JS_READ_OBJ_BYTECODE, &am, msg, sizeof(msg));
     free(buf);
     if (JS_IsException(obj)) {
-        size_t used = strlen(mod->name);
+        if (err && err_cap) {
+            size_t used;
 
-        luna_copy_str(err, err_cap, mod->name);
-        luna_copy_str(err + used, err_cap > used ? err_cap - used : 0,
-                     msg[0] ? msg : ": cannot decrypt entrypoint");
+            luna_copy_str(err, err_cap, mod->name);
+            used = strlen(err);
+            luna_copy_str(err + used, err_cap > used ? err_cap - used : 0,
+                         msg[0] ? msg : ": cannot decrypt entrypoint");
+        }
         return JS_EXCEPTION;
     }
     return obj;
@@ -1055,19 +1600,6 @@ static int luna_eval_mod(LunaMods *m, LunaLoadedMod *mod, char *err, size_t err_
     return 0;
 }
 
-/* Split "com.luna.mods.core@^1.2.0" into name and spec. */
-static void luna_split_dep(const char *dep, char *name, size_t name_cap, const char **spec)
-{
-    const char *at = strchr(dep, '@');
-    size_t n = at ? (size_t)(at - dep) : strlen(dep);
-
-    if (n >= name_cap)
-        n = name_cap - 1;
-    memcpy(name, dep, n);
-    name[n] = '\0';
-    *spec = at ? at + 1 : NULL;
-}
-
 /* ------------------------------------------------------------------ */
 /* discovery                                                           */
 /* ------------------------------------------------------------------ */
@@ -1078,6 +1610,14 @@ typedef struct LunaModDir {
     int priority;
     LunaManifest manifest;
 } LunaModDir;
+
+/* A directory that looks like a mod (it has manifest.json) but cannot be
+ * used. Reported to the host instead of being silently skipped. */
+typedef struct LunaScanIssue {
+    char *dir;
+    char *root;
+    char *error;
+} LunaScanIssue;
 
 static void luna_moddir_free(LunaModDir *md)
 {
@@ -1090,23 +1630,71 @@ static void luna_moddir_free(LunaModDir *md)
     luna_manifest_clear(&md->manifest);
 }
 
+static void luna_scan_issue_add(LunaScanIssue **issues, size_t *count,
+                                const char *dir, const char *root, const char *error)
+{
+    LunaScanIssue *grown;
+
+    if (*count >= LUNA_SCAN_ISSUE_MAX)
+        return;
+    grown = (LunaScanIssue *)realloc(*issues, (*count + 1) * sizeof(**issues));
+    if (!grown)
+        return;
+    *issues = grown;
+    memset(&grown[*count], 0, sizeof(**issues));
+    grown[*count].dir = strdup(dir);
+    grown[*count].root = strdup(root);
+    grown[*count].error = strdup(error);
+    if (!grown[*count].dir || !grown[*count].root || !grown[*count].error) {
+        free(grown[*count].dir);
+        free(grown[*count].root);
+        free(grown[*count].error);
+        return;
+    }
+    (*count)++;
+}
+
+static void luna_scan_issues_free(LunaScanIssue *issues, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        free(issues[i].dir);
+        free(issues[i].root);
+        free(issues[i].error);
+    }
+    free(issues);
+}
+
+static int luna_scan_issue_cmp(const void *a, const void *b)
+{
+    const LunaScanIssue *x = (const LunaScanIssue *)a;
+    const LunaScanIssue *y = (const LunaScanIssue *)b;
+
+    return strcmp(x->dir, y->dir);
+}
+
 static int luna_scan_root(JSContext *ctx, const char *root, int priority,
-                          LunaModDir **out, size_t *out_count)
+                          LunaModDir **out, size_t *out_count,
+                          LunaScanIssue **out_issues, size_t *out_issue_count)
 {
     DIR *d;
     struct dirent *de;
     LunaModDir *found = NULL;
-    size_t count = 0;
+    LunaScanIssue *issues = NULL;
+    size_t count = 0, issue_count = 0;
 
     *out = NULL;
     *out_count = 0;
+    *out_issues = NULL;
+    *out_issue_count = 0;
     if (!luna_is_dir(root))
         return 0;
     d = opendir(root);
     if (!d)
         return 0;
     while ((de = readdir(d)) != NULL) {
-        char dir[1024], manifest[1200];
+        char dir[1024], manifest[1200], msg[512];
         LunaManifest m;
         LunaModDir *grown;
 
@@ -1121,7 +1709,12 @@ static int luna_scan_root(JSContext *ctx, const char *root, int priority,
         if (!luna_is_file(manifest))
             continue;
         memset(&m, 0, sizeof(m));
-        if (luna_manifest_load(ctx, dir, &m) != 0) {
+        if (luna_manifest_load(ctx, dir, &m, msg, sizeof(msg)) != 0) {
+            luna_scan_issue_add(&issues, &issue_count, dir, root, msg);
+            continue;
+        }
+        if (luna_manifest_validate(&m, msg, sizeof(msg)) != 0) {
+            luna_scan_issue_add(&issues, &issue_count, dir, root, msg);
             luna_manifest_clear(&m);
             continue;
         }
@@ -1145,6 +1738,8 @@ static int luna_scan_root(JSContext *ctx, const char *root, int priority,
     closedir(d);
     *out = found;
     *out_count = count;
+    *out_issues = issues;
+    *out_issue_count = issue_count;
     return 0;
 }
 
@@ -1377,38 +1972,72 @@ static size_t luna_satisfied_requirements(LunaModDir *dirs, LunaPackage *pkgs, s
     return total;
 }
 
+/* Optional requirements are a preference, not a constraint: among selections
+ * that load the same mods and satisfy the same required dependencies, prefer
+ * one that also satisfies more optionalDependencies. */
+static size_t luna_satisfied_optional(LunaModDir *dirs, LunaPackage *pkgs, size_t pkg_count)
+{
+    size_t i, k, total = 0;
+
+    for (i = 0; i < pkg_count; i++) {
+        const LunaManifest *man = &dirs[pkgs[i].chosen].manifest;
+
+        for (k = 0; k < man->opt_dep_count; k++) {
+            LunaDepRef ref;
+            LunaPackage *p;
+
+            luna_dep_ref(man->opt_deps[k], &ref);
+            if (strcmp(ref.name, LUNA_MODS_API_NAME) == 0) {
+                if (luna_version_matches(LUNA_MODS_API_VERSION, ref.spec))
+                    total++;
+                continue;
+            }
+            p = luna_find_package(pkgs, pkg_count, ref.name);
+            if (p && luna_version_matches(dirs[p->chosen].manifest.version, ref.spec))
+                total++;
+        }
+    }
+    return total;
+}
+
 /*
  * Hill climbing from "newest copy of everything": each sweep tries to improve
- * how many mods the selection can load, then how many requirements it
- * satisfies, and keeps only strict improvements, so it always terminates and
- * the result does not depend on directory iteration order.
+ * how many mods the selection can load, then how many required requirements
+ * it satisfies, then how many optional ones, and keeps only strict
+ * improvements, so it always terminates and the result does not depend on
+ * directory iteration order.
  */
 static void luna_select_versions(LunaModDir *dirs, LunaPackage *pkgs, size_t pkg_count)
 {
     size_t i, k, sweep;
+    size_t max_sweeps = pkg_count * 2 + 4;
 
     for (i = 0; i < pkg_count; i++)
         pkgs[i].chosen = pkgs[i].cands[0];
 
-    for (sweep = 0; sweep < 16; sweep++) {
+    for (sweep = 0; sweep < max_sweeps; sweep++) {
         int changed = 0;
 
         for (i = 0; i < pkg_count; i++) {
             size_t original = pkgs[i].chosen;
             size_t current_primary = luna_count_loadable(dirs, pkgs, pkg_count);
             size_t current_secondary = luna_satisfied_requirements(dirs, pkgs, pkg_count);
+            size_t current_optional = luna_satisfied_optional(dirs, pkgs, pkg_count);
 
             for (k = 0; k < pkgs[i].cand_count; k++) {
                 size_t cand = pkgs[i].cands[k];
-                size_t primary, secondary;
+                size_t primary, secondary, optional;
 
                 if (cand == pkgs[i].chosen)
                     continue;
                 pkgs[i].chosen = cand;
                 primary = luna_count_loadable(dirs, pkgs, pkg_count);
                 secondary = luna_satisfied_requirements(dirs, pkgs, pkg_count);
+                optional = luna_satisfied_optional(dirs, pkgs, pkg_count);
                 if (primary > current_primary ||
-                    (primary == current_primary && secondary > current_secondary)) {
+                    (primary == current_primary && secondary > current_secondary) ||
+                    (primary == current_primary && secondary == current_secondary &&
+                     optional > current_optional)) {
                     changed = 1;
                     break;
                 }
@@ -1461,6 +2090,72 @@ static void luna_dep_label(const char *dep, const char *spec, char *out, size_t 
         snprintf(out, cap, "%s@%s", dep, spec);
     else
         snprintf(out, cap, "%s", dep);
+}
+
+static void luna_warning_add(char **warnings, size_t *count, const char *text)
+{
+    char *copy = strdup(text);
+
+    if (copy)
+        warnings[(*count)++] = copy;
+}
+
+/* Soft dependency diagnostics, computed once the final loaded/failed state is
+ * known. Warnings never influence selection or loadability. */
+static char **luna_optional_warnings(const LunaManifest *man, LunaModDir *dirs,
+                                     LunaPackage *pkgs, LunaModEntry *entries,
+                                     size_t pkg_count, size_t *out_count)
+{
+    char **warnings;
+    size_t count = 0, k;
+
+    *out_count = 0;
+    if (man->opt_dep_count == 0)
+        return NULL;
+    warnings = (char **)calloc(man->opt_dep_count, sizeof(char *));
+    if (!warnings)
+        return NULL;
+    for (k = 0; k < man->opt_dep_count; k++) {
+        LunaDepRef ref;
+        LunaPackage *p;
+        char label[300], msg[512];
+
+        luna_dep_ref(man->opt_deps[k], &ref);
+        luna_dep_label(ref.name, ref.spec, label, sizeof(label));
+        if (strcmp(ref.name, LUNA_MODS_API_NAME) == 0) {
+            if (!luna_version_matches(LUNA_MODS_API_VERSION, ref.spec)) {
+                snprintf(msg, sizeof(msg),
+                         "optional loader API '%s' is not satisfied (loader API is %s)",
+                         label, LUNA_MODS_API_VERSION);
+                luna_warning_add(warnings, &count, msg);
+            }
+            continue;
+        }
+        p = luna_find_package(pkgs, pkg_count, ref.name);
+        if (!p) {
+            snprintf(msg, sizeof(msg), "optional dependency '%s' is not installed", label);
+            luna_warning_add(warnings, &count, msg);
+            continue;
+        }
+        if (!luna_version_matches(dirs[p->chosen].manifest.version, ref.spec)) {
+            snprintf(msg, sizeof(msg),
+                     "optional dependency '%s' is not satisfied (selected version %s)",
+                     label, dirs[p->chosen].manifest.version);
+            luna_warning_add(warnings, &count, msg);
+            continue;
+        }
+        if (entries[p - pkgs].failed) {
+            snprintf(msg, sizeof(msg),
+                     "optional dependency '%s' failed to load", label);
+            luna_warning_add(warnings, &count, msg);
+        }
+    }
+    if (count == 0) {
+        free(warnings);
+        return NULL;
+    }
+    *out_count = count;
+    return warnings;
 }
 
 static void luna_fail_missing(LunaModEntry *e, const char *dep, const char *spec)
@@ -1927,12 +2622,20 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
     LunaModEntry *entries = NULL;
     LunaModInfo *info = NULL;
     size_t info_count = 0;
+    LunaScanIssue *issues = NULL;
+    size_t issue_count = 0;
     int rc = -1;
 
     if (!m || !roots || !out || !out_count)
         return -1;
     *out = NULL;
     *out_count = 0;
+    if (m->count > 0) {
+        snprintf(err, err_cap,
+                 "loader already loaded %zu mod(s); create a fresh loader to rescan",
+                 m->count);
+        return -1;
+    }
     if (luna_integrity_check(m)) {
         snprintf(err, err_cap, "runtime integrity check failed");
         return -1;
@@ -1943,26 +2646,52 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
     for (i = 0; i < root_count; i++) {
         LunaModDir *partial = NULL;
         size_t partial_count = 0;
+        LunaScanIssue *partial_issues = NULL;
+        size_t partial_issue_count = 0;
 
-        if (luna_scan_root(m->ctx, roots[i], (int)i, &partial, &partial_count) == 0 && partial) {
+        luna_scan_root(m->ctx, roots[i], (int)i, &partial, &partial_count,
+                       &partial_issues, &partial_issue_count);
+        if (partial) {
             LunaModDir *grown = (LunaModDir *)realloc(dirs, (dir_count + partial_count) * sizeof(*dirs));
 
             if (grown) {
                 memcpy(grown + dir_count, partial, partial_count * sizeof(*grown));
                 dir_count += partial_count;
                 dirs = grown;
+                free(partial);
             } else {
                 size_t k;
 
                 for (k = 0; k < partial_count; k++)
                     luna_moddir_free(&partial[k]);
+                free(partial);
             }
-            free(partial);
+        }
+        if (partial_issues) {
+            LunaScanIssue *grown = (LunaScanIssue *)realloc(issues, (issue_count + partial_issue_count) * sizeof(*issues));
+
+            if (grown) {
+                memcpy(grown + issue_count, partial_issues, partial_issue_count * sizeof(*grown));
+                issue_count += partial_issue_count;
+                issues = grown;
+                free(partial_issues);
+            } else {
+                luna_scan_issues_free(partial_issues, partial_issue_count);
+            }
         }
     }
+    if (issues)
+        qsort(issues, issue_count, sizeof(*issues), luna_scan_issue_cmp);
+
     if (dir_count == 0) {
-        snprintf(err, err_cap, "no mods found in %zu root(s)", root_count);
-        return -1;
+        if (issue_count > 0) {
+            snprintf(err, err_cap,
+                     "no loadable mods in %zu root(s); %zu invalid manifest(s), first: %s: %s",
+                     root_count, issue_count, issues[0].dir, issues[0].error);
+        } else {
+            snprintf(err, err_cap, "no mods found in %zu root(s)", root_count);
+        }
+        goto done;
     }
     /* deterministic order no matter what readdir() reported */
     qsort(dirs, dir_count, sizeof(*dirs), luna_moddir_cmp);
@@ -1975,13 +2704,13 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
     luna_select_versions(dirs, pkgs, pkg_count);
     luna_materialize_chosen(dirs, pkgs, pkg_count, writable_root);
 
+    info_count = pkg_count + issue_count;
     entries = (LunaModEntry *)calloc(pkg_count, sizeof(*entries));
-    info = (LunaModInfo *)calloc(pkg_count, sizeof(*info));
+    info = (LunaModInfo *)calloc(info_count, sizeof(*info));
     if (!entries || !info) {
         snprintf(err, err_cap, "out of memory");
         goto done;
     }
-    info_count = pkg_count;
     for (i = 0; i < pkg_count; i++) {
         LunaModDir *md = &dirs[pkgs[i].chosen];
         LunaLoadedMod *mod;
@@ -1995,6 +2724,11 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
         info[i].entry = strdup(md->manifest.entry);
         info[i].dir = strdup(md->dir);
         info[i].root = strdup(md->root);
+        if (!info[i].name || !info[i].version || !info[i].author ||
+            !info[i].icon || !info[i].entry || !info[i].dir || !info[i].root) {
+            snprintf(err, err_cap, "out of memory");
+            goto done;
+        }
         mod = luna_mods_add(m, md->manifest.name);
         if (!mod) {
             snprintf(err, err_cap, "out of memory");
@@ -2004,6 +2738,35 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
         free(mod->entry);
         mod->dir = strdup(md->dir);
         mod->entry = strdup(md->manifest.entry);
+        if (!mod->dir || !mod->entry) {
+            snprintf(err, err_cap, "out of memory");
+            goto done;
+        }
+    }
+
+    /* Rejected manifests are part of the result: a mod that disappears
+     * silently is impossible to debug from a host UI. */
+    for (i = 0; i < issue_count; i++) {
+        LunaModInfo *row = &info[pkg_count + i];
+        const char *base = strrchr(issues[i].dir, '/');
+        size_t need = strlen(issues[i].error) + 32;
+
+        base = base ? base + 1 : issues[i].dir;
+        row->name = strdup(base);
+        row->version = strdup("");
+        row->author = strdup("");
+        row->icon = strdup("");
+        row->entry = strdup("");
+        row->dir = strdup(issues[i].dir);
+        row->root = strdup(issues[i].root);
+        row->error = (char *)malloc(need);
+        if (!row->name || !row->version || !row->author || !row->icon ||
+            !row->entry || !row->dir || !row->root || !row->error) {
+            snprintf(err, err_cap, "out of memory");
+            goto done;
+        }
+        snprintf(row->error, need, "invalid manifest: %s", issues[i].error);
+        row->failed = 1;
     }
 
     /* mods import each other by package name, so the hooks have to be live
@@ -2038,6 +2801,13 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
         if (entries[i].error[0])
             info[i].error = strdup(entries[i].error);
     }
+    /* warnings are diagnostics only; compute them after every status is
+     * final so "the optional package failed" is reported correctly */
+    for (i = 0; i < pkg_count; i++) {
+        info[i].warnings = luna_optional_warnings(&dirs[pkgs[i].chosen].manifest,
+                                                  dirs, pkgs, entries, pkg_count,
+                                                  &info[i].warning_count);
+    }
 
     *out = info;
     *out_count = info_count;
@@ -2060,5 +2830,6 @@ int luna_mods_load(LunaMods *m, const char **roots, size_t root_count,
             luna_moddir_free(&dirs[k]);
     }
     free(dirs);
+    luna_scan_issues_free(issues, issue_count);
     return rc;
 }
